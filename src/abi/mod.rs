@@ -369,8 +369,10 @@ mod native {
             self.check_array(ptr, count, 4)?;
             let bytes = self.read_vec(ptr, u64::from(count) * 4)?;
             Ok(bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect())
         }
 
@@ -378,8 +380,10 @@ mod native {
             self.check_array(ptr, count, 8)?;
             let bytes = self.read_vec(ptr, u64::from(count) * 8)?;
             Ok(bytes
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().expect("chunk of 8")))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
                 .collect())
         }
 

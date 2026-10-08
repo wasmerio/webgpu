@@ -47,8 +47,15 @@ jobs:
           # No GPU on the Linux runners: Mesa's software Vulkan stands in.
           - os: ubuntu-24.04
             fallback_adapter: "1"
+            test: make test-native
+          # The macOS runners have no Metal device at all, so the programs
+          # cannot run there. Everything is still compiled (the Metal backend,
+          # the window host), and what needs no adapter is tested.
           - os: macos-15
             fallback_adapter: ""
+            test: >-
+              cargo build --features cli,window --all-targets &&
+              cargo test --features cli --lib --test abi_sweep
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -66,7 +73,7 @@ jobs:
       - name: Test
         env:
           WEBGPU_TEST_FALLBACK_ADAPTER: ${{ matrix.fallback_adapter }}
-        run: make test-native
+        run: ${{ matrix.test }}
 
   browser:
     name: Browser host (Chrome)

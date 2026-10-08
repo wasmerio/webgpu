@@ -56,7 +56,12 @@ fn headless_surfaces_hand_presented_frames_to_the_sink() {
         FrameFormat::Bgra8 => [255, 0, 0, 255],
     };
     assert!(
-        frame.pixels.chunks_exact(4).all(|pixel| pixel == blue),
+        frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == blue),
         "the last frame is solid blue"
     );
     // The program asked for nothing special about its colours.

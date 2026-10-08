@@ -86,7 +86,7 @@ impl FrameSink for SaveFrames {
             return;
         };
         let mut out = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
-        for pixel in pixels.chunks_exact(4) {
+        for pixel in pixels.as_chunks::<4>().0 {
             match frame.format {
                 FrameFormat::Rgba8 => out.extend_from_slice(&pixel[..3]),
                 FrameFormat::Bgra8 => out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]),
