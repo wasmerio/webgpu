@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>wasmer-webgpu browser tests</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 1.5rem; }
+  canvas { width: 160px; height: 120px; border: 1px solid #999; margin: 0 4px 4px 0; }
+  pre { background: #f4f4f4; padding: 0.75rem; overflow: auto; }
+  .passed { color: #0a7a2f; }
+  .failed { color: #b3261e; }
+</style>
+<h1>wasmer-webgpu browser tests</h1>
+<p>
+  Runs the programs of <code>tests/manifest.json</code> against <code>js/webgpu_host.js</code>.
+  Serve this page with <code>node tests/browser/run.mjs --serve</code>: it needs the
+  cross-origin isolation headers that script sends. Add <code>?test=name</code> to run one program.
+</p>
+<div id="results"></div>
+<script type="module">
+  import { runHostTests } from './host_tests.js';
+  import { runProgram } from './runner.js';
+  import { runAbiSweep } from './sweep.js';
+
+  // run.mjs calls these through the page.
+  window.runProgram = runProgram;
+  window.runAbiSweep = runAbiSweep;
+  window.runHostTests = runHostTests;
+
+  // Opened by hand: run the manifest and show what happened.
+  if (!navigator.webdriver) {
+    const only = new URLSearchParams(location.search).get('test');
+    const { tests } = await (await fetch('../manifest.json')).json();
+    const results = document.getElementById('results');
+    for (const test of tests) {
+      if (test.browser === false || (only && test.name !== only)) continue;
+      const outcome = await runProgram(test.name, { args: test.args });
+      const passed = outcome.error === null && outcome.exitCode === 0 && outcome.stdout === test.stdout;
+      const section = document.createElement('section');
+      const heading = document.createElement('h2');
+      heading.className = passed ? 'passed' : 'failed';
+      heading.textContent = `${passed ? 'ok' : 'FAILED'} ${test.name}`;
+      const transcript = document.createElement('pre');
+      transcript.textContent = [
+        outcome.stdout,
+        outcome.stderr && `--- stderr ---\n${outcome.stderr}`,
+        outcome.error && `--- error ---\n${outcome.error}`,
+        outcome.log.length !== 0 && `--- host log ---\n${outcome.log.join('\n')}`,
+      ].filter(Boolean).join('\n');
+      section.append(heading, transcript);
+      results.append(section);
+    }
+  }
+</script>
+</html>

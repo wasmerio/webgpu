@@ -1,0 +1,12 @@
+{
+  "name": "wasmer-webgpu-browser-tests",
+  "private": true,
+  "type": "module",
+  "description": "Runs the wasmer-webgpu conformance programs against js/webgpu_host.js in Chrome.",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.63.0"
+  }
+}

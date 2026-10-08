@@ -1,0 +1,104 @@
+[package]
+name = "wasmer-webgpu"
+version = "0.704.0"
+description = "WebGPU (webgpu.h) for WASIX guests running on the Wasmer WebAssembly runtime"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/wasmerio/webgpu"
+exclude = ["tests/programs/out", "tests/browser/node_modules", "examples/out", "lib", "dist"]
+
+[features]
+default = []
+# Implements the WASIX runtime's `InstantiationHook` for `WebGpuRuntimeHooks`.
+wasix = ["dep:wasmer-wasix"]
+# Standalone runner (`webgpu_wasmer`) and the helpers the manifest tests use.
+cli = [
+  "wasix",
+  "dep:tokio",
+  "dep:virtual-fs",
+  "dep:wasmer-types",
+]
+# Uses the JavaScript realm's `navigator.gpu` when this crate is compiled as part
+# of a wasm32-unknown-unknown wasm-bindgen module. Inert on native targets, where
+# the wgpu backend is always the implementation.
+js = [
+  "dep:js-sys",
+  "dep:wasm-bindgen",
+  "dep:wasm-bindgen-futures",
+  "wasmer/experimental-async",
+  "wasmer/js-default",
+]
+# Opens host windows for guest surfaces (native only).
+window = ["dep:winit"]
+
+[dependencies]
+anyhow = "1"
+# Named by version, resolved by the embedding workspace: Wasmer's own checkout
+# patches these to its path crates, the SDK and this repository's standalone
+# builds patch them to one pinned Wasmer revision (see `[patch.crates-io]`
+# below). Wasmer's crates pin each other exactly, so one requirement that both
+# can satisfy is all that has to be said here.
+wasmer = { version = "7.4", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmer = { version = "7.4", default-features = false, features = ["sys-default"] }
+wasmer-wasix = { version = "0.704", default-features = false, features = ["sys"], optional = true }
+# Not wgpu 30 yet: it requires js-sys 0.3.104 (wasm-bindgen 0.2.127), and a
+# lockfile records that even where wgpu is never built for the web. The Wasmer
+# SDK shares its lockfile with this crate and pins wasm-bindgen 0.2.126.
+wgpu = { version = "29.0.4", default-features = false, features = [
+  "std",
+  "parking_lot",
+  "wgsl",
+  "metal",
+  "vulkan",
+  "dx12",
+] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+winit = { version = "0.30", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+virtual-fs = { version = "0.704", optional = true }
+wasmer-types = { version = "7.4", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2.120", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+wasmer-wasix = { version = "0.704", default-features = false, features = ["js"], optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wat = "1"
+
+[[bin]]
+name = "webgpu_wasmer"
+path = "src/bin/webgpu_wasmer.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "manifest_tests"
+path = "tests/manifest_tests.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "embedder_tests"
+path = "tests/embedder_tests.rs"
+required-features = ["cli"]
+
+# This repository builds on its own. When the crate is consumed by path from
+# another workspace (the Wasmer SDK, or `wasmer/lib/webgpu`), that workspace's
+# own patches apply and this section is ignored.
+[workspace]
+
+[patch.crates-io]
+virtual-fs = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }
+virtual-mio = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }
+virtual-net = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }
+wasmer = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }
+wasmer-config = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }
+wasmer-package = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }
+wasmer-types = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }
+wasmer-wasix = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }
+wasmer-wasix-types = { git = "https://github.com/wasmerio/wasmer.git", rev = "5bd2b7d3182e816bd0ea330acc88e4e4733e167f" }

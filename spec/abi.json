@@ -1,0 +1,216 @@
+{
+  "_comment": "Hand-maintained ABI tables that webgpu.json does not encode. Consumed by codegen/gen.py.",
+  "import_module": "wasmer_webgpu_v0",
+
+  "shim_only": [
+    "wgpuGetInstanceFeatures",
+    "wgpuGetProcAddress",
+    "wgpuInstanceGetWGSLLanguageFeatures",
+    "wgpuInstanceProcessEvents",
+    "wgpuInstanceRequestAdapter",
+    "wgpuInstanceWaitAny",
+    "wgpuInstanceRelease",
+    "wgpuAdapterGetFeatures",
+    "wgpuAdapterGetInfo",
+    "wgpuAdapterRequestDevice",
+    "wgpuBufferGetConstMappedRange",
+    "wgpuBufferGetMappedRange",
+    "wgpuBufferMapAsync",
+    "wgpuBufferRelease",
+    "wgpuDeviceCreateComputePipelineAsync",
+    "wgpuDeviceCreateRenderPipelineAsync",
+    "wgpuDeviceGetAdapterInfo",
+    "wgpuDeviceGetFeatures",
+    "wgpuDeviceGetLostFuture",
+    "wgpuDevicePopErrorScope",
+    "wgpuDeviceRelease",
+    "wgpuQueueOnSubmittedWorkDone",
+    "wgpuShaderModuleGetCompilationInfo",
+    "wgpuSurfaceGetCapabilities",
+    "wgpuAdapterInfoFreeMembers",
+    "wgpuSupportedFeaturesFreeMembers",
+    "wgpuSupportedInstanceFeaturesFreeMembers",
+    "wgpuSupportedWGSLLanguageFeaturesFreeMembers",
+    "wgpuSurfaceCapabilitiesFreeMembers"
+  ],
+
+  "shim_with_import": [
+    "wgpuBufferUnmap",
+    "wgpuBufferDestroy"
+  ],
+
+  "special_imports": [
+    { "name": "wasmer_wgpu_abi_version",
+      "c": "uint32_t %s(void)",
+      "params": [], "result": "i32",
+      "doc": "Host ABI revision. The shim refuses to run against a host that reports a different major revision." },
+
+    { "name": "wasmer_wgpu_object_instance",
+      "c": "uint32_t %s(uint32_t handle)",
+      "params": [["handle", "i32"]], "result": "i32",
+      "doc": "Instance handle an object descends from, or 0. Events are delivered per instance." },
+
+    { "name": "wasmer_wgpu_instance_request_adapter",
+      "c": "void %s(WGPUInstance instance, WGPURequestAdapterOptions const * options, uint64_t future)",
+      "params": [["instance", "i32"], ["options", "i32"], ["future", "i64"]], "result": null },
+    { "name": "wasmer_wgpu_adapter_request_device",
+      "c": "void %s(WGPUAdapter adapter, WGPUDeviceDescriptor const * descriptor, uint64_t future, uint64_t lost_future)",
+      "params": [["adapter", "i32"], ["descriptor", "i32"], ["future", "i64"], ["lost_future", "i64"]], "result": null },
+    { "name": "wasmer_wgpu_buffer_map_async",
+      "c": "void %s(WGPUBuffer buffer, uint64_t mode, uint32_t offset, uint32_t size, uint64_t future)",
+      "params": [["buffer", "i32"], ["mode", "i64"], ["offset", "i32"], ["size", "i32"], ["future", "i64"]], "result": null },
+    { "name": "wasmer_wgpu_device_pop_error_scope",
+      "c": "void %s(WGPUDevice device, uint64_t future)",
+      "params": [["device", "i32"], ["future", "i64"]], "result": null },
+    { "name": "wasmer_wgpu_device_create_compute_pipeline_async",
+      "c": "void %s(WGPUDevice device, WGPUComputePipelineDescriptor const * descriptor, uint64_t future)",
+      "params": [["device", "i32"], ["descriptor", "i32"], ["future", "i64"]], "result": null },
+    { "name": "wasmer_wgpu_device_create_render_pipeline_async",
+      "c": "void %s(WGPUDevice device, WGPURenderPipelineDescriptor const * descriptor, uint64_t future)",
+      "params": [["device", "i32"], ["descriptor", "i32"], ["future", "i64"]], "result": null },
+    { "name": "wasmer_wgpu_queue_on_submitted_work_done",
+      "c": "void %s(WGPUQueue queue, uint64_t future)",
+      "params": [["queue", "i32"], ["future", "i64"]], "result": null },
+    { "name": "wasmer_wgpu_shader_module_get_compilation_info",
+      "c": "void %s(WGPUShaderModule shader_module, uint64_t future)",
+      "params": [["shader_module", "i32"], ["future", "i64"]], "result": null },
+
+    { "name": "wasmer_wgpu_poll",
+      "c": "int32_t %s(void * buf, uint32_t cap)",
+      "params": [["buf", "i32"], ["cap", "i32"]], "result": "i32",
+      "doc": "Drives the backend once and writes ready event records. Returns bytes written, or -needed if the next record does not fit." },
+    { "name": "wasmer_wgpu_epoch",
+      "c": "uint64_t %s(void)",
+      "params": [], "result": "i64",
+      "doc": "Counts the event records queued so far. Read it before looking for ready events, then hand it to wasmer_wgpu_wait: an event that arrives in between (and may be collected by another guest thread) makes the wait return instead of being missed." },
+    { "name": "wasmer_wgpu_wait",
+      "c": "int32_t %s(uint64_t const * futures, uint32_t count, uint64_t timeout_ns, uint64_t epoch, void * buf, uint32_t cap)",
+      "params": [["futures", "i32"], ["count", "i32"], ["timeout_ns", "i64"], ["epoch", "i64"], ["buf", "i32"], ["cap", "i32"]], "result": "i32",
+      "suspending": true,
+      "doc": "Blocks until one of the listed futures is ready, any event was queued since `epoch`, or the timeout elapses; then behaves like poll. INT32_MIN means this host cannot block." },
+    { "name": "wasmer_wgpu_yield",
+      "c": "void %s(void)",
+      "params": [], "result": null,
+      "suspending": true,
+      "doc": "Lets the host make progress on outstanding work. A no-op natively; one event-loop turn in a browser." },
+
+    { "name": "wasmer_wgpu_instance_release",
+      "c": "uint32_t %s(WGPUInstance instance)",
+      "params": [["instance", "i32"]], "result": "i32",
+      "doc": "Releases one reference. Returns 1 when that was the last one held by the guest." },
+    { "name": "wasmer_wgpu_buffer_release",
+      "c": "uint32_t %s(WGPUBuffer buffer)",
+      "params": [["buffer", "i32"]], "result": "i32" },
+    { "name": "wasmer_wgpu_device_release",
+      "c": "uint32_t %s(WGPUDevice device)",
+      "params": [["device", "i32"]], "result": "i32" },
+
+    { "name": "wasmer_wgpu_buffer_map_info",
+      "c": "uint32_t %s(WGPUBuffer buffer, void * out)",
+      "params": [["buffer", "i32"], ["out", "i32"]], "result": "i32",
+      "doc": "Writes { u64 offset; u64 size; u32 mode; u32 state } for the current mapping. Returns 0 for an unknown buffer." },
+
+    { "name": "wasmer_wgpu_adapter_get_info",
+      "c": "int32_t %s(WGPUAdapter adapter, void * buf, uint32_t cap)",
+      "params": [["adapter", "i32"], ["buf", "i32"], ["cap", "i32"]], "result": "i32",
+      "doc": "Serializes adapter info. Returns the bytes required; the buffer is filled only if that fits in cap." },
+    { "name": "wasmer_wgpu_device_get_adapter_info",
+      "c": "int32_t %s(WGPUDevice device, void * buf, uint32_t cap)",
+      "params": [["device", "i32"], ["buf", "i32"], ["cap", "i32"]], "result": "i32" },
+    { "name": "wasmer_wgpu_adapter_get_features",
+      "c": "int32_t %s(WGPUAdapter adapter, void * buf, uint32_t cap)",
+      "params": [["adapter", "i32"], ["buf", "i32"], ["cap", "i32"]], "result": "i32" },
+    { "name": "wasmer_wgpu_device_get_features",
+      "c": "int32_t %s(WGPUDevice device, void * buf, uint32_t cap)",
+      "params": [["device", "i32"], ["buf", "i32"], ["cap", "i32"]], "result": "i32" },
+    { "name": "wasmer_wgpu_instance_get_wgsl_language_features",
+      "c": "int32_t %s(WGPUInstance instance, void * buf, uint32_t cap)",
+      "params": [["instance", "i32"], ["buf", "i32"], ["cap", "i32"]], "result": "i32" },
+    { "name": "wasmer_wgpu_surface_get_capabilities",
+      "c": "int32_t %s(WGPUSurface surface, WGPUAdapter adapter, void * buf, uint32_t cap)",
+      "params": [["surface", "i32"], ["adapter", "i32"], ["buf", "i32"], ["cap", "i32"]], "result": "i32",
+      "doc": "Serializes { u64 usages; u32 formats; u32 presentModes; u32 alphaModes; u32 pad } followed by the three u32 arrays. Negative on error." }
+  ],
+
+  "_suspending_comment": "Imports a browser host has to suspend the guest for (JSPI). Presenting waits for the next animation frame; creating a surface may have to fetch the canvas from another thread. Natively these simply block.",
+  "suspending_imports": [
+    "wgpuSurfacePresent",
+    "wgpuInstanceCreateSurface"
+  ],
+
+  "event_kinds": [
+    ["request_adapter", 1],
+    ["request_device", 2],
+    ["buffer_map", 3],
+    ["pop_error_scope", 4],
+    ["create_compute_pipeline", 5],
+    ["create_render_pipeline", 6],
+    ["queue_work_done", 7],
+    ["compilation_info", 8],
+    ["device_lost", 9],
+    ["uncaptured_error", 10]
+  ],
+
+  "lenient_enums": [
+    "feature_name",
+    "instance_feature_name",
+    "WGSL_language_feature_name"
+  ],
+
+  "host_written_structs": [
+    "limits",
+    "compatibility_mode_limits",
+    "instance_limits",
+    "surface_texture"
+  ],
+
+  "extra_extends": {
+    "surface_color_management": ["surface_configuration"]
+  },
+
+  "extension": {
+    "prefix": "wasix",
+    "enum_prefix": "0x0007",
+    "stypes": {
+      "wasix_surface_source_canvas": "0x00070001"
+    },
+    "stype_aliases": {
+      "0x00040000": "wasix_surface_source_canvas"
+    },
+    "source_aliases": [
+      {
+        "struct": "wasix_surface_source_canvas",
+        "c_name": "WGPUEmscriptenSurfaceSourceCanvasHTMLSelector",
+        "stype_c_name": "WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector",
+        "stype": "0x00040000",
+        "init": "WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT",
+        "doc": "Source compatibility with programs written for Emscripten, which has the same struct under this name. Hosts accept either sType."
+      }
+    ],
+    "structs": [
+      {
+        "name": "wasix_surface_source_canvas",
+        "type": "extension",
+        "extends": ["surface_descriptor"],
+        "doc": "Chained in WGPUSurfaceDescriptor to make a WGPUSurface from a presentation target the host provides (a canvas in the browser, a window or headless target natively).",
+        "members": [
+          { "name": "selector", "type": "string_with_default_empty",
+            "doc": "Names the host-provided target, for example \"#canvas\". Empty selects the default target." }
+        ]
+      }
+    ],
+    "functions": [
+      {
+        "c_name": "wgpuWasixSurfaceGetSize",
+        "object": "surface",
+        "name": "wasix_get_size",
+        "doc": "Current size, in physical pixels, of the target behind the surface. Use it to (re)configure after wgpuSurfaceGetCurrentTexture reports Outdated.",
+        "returns": { "type": "enum.status" },
+        "args": [
+          { "name": "width", "type": "uint32", "pointer": "mutable" },
+          { "name": "height", "type": "uint32", "pointer": "mutable" }
+        ]
+      }
+    ]
+  }
+}

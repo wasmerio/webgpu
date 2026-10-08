@@ -1,0 +1,288 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index b72df3baa23..d43f9691130 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -71,9 +71,15 @@ members = [
+   "tests/lib/wast",
+   "tests/wasmer-argus",
+ ]
+-exclude = ["./lib/cli/tests/packages/axum", "lib/wild"]
++exclude = ["./lib/cli/tests/packages/axum", "lib/wild", "lib/webgpu"]
+ resolver = "2"
+ 
++# `lib/webgpu` is a repository of its own that names its Wasmer dependencies
++# by version, not by path. In this workspace they are this checkout's crates.
++[patch.crates-io]
++wasmer = { path = "lib/api" }
++wasmer-wasix = { path = "lib/wasix" }
++
+ [workspace.package]
+ authors = ["Wasmer Engineering Team <engineering@wasmer.io>"]
+ edition = "2024"
+diff --git a/lib/cli/Cargo.toml b/lib/cli/Cargo.toml
+index 43f7c209235..e5f55bab086 100644
+--- a/lib/cli/Cargo.toml
++++ b/lib/cli/Cargo.toml
+@@ -113,6 +113,10 @@ headless = ["dep:wasmer-vm", "wasmer/sys"]
+ headless-minimal = ["headless", "disable-all-logging"]
+ telemetry = []
+ napi-v8 = ["dep:wasmer-napi", "wasmer-napi/wasix"]
++# WebGPU (webgpu.h) for WASIX guests, running on wgpu.
++webgpu = ["dep:wasmer-webgpu", "wasmer-webgpu/wasix"]
++# Shows the surfaces WebGPU guests present to in windows.
++webgpu-window = ["webgpu", "wasmer-webgpu/window"]
+ wasm-c-api = ["dep:wasmer-c-api-imports", "wasmer-c-api-imports/wasix"]
+ 
+ # Optional
+@@ -151,6 +155,7 @@ wasmer-types = { version = "=7.4.2", path = "../types", features = [
+   "detect-wasm-features",
+ ] }
+ wasmer-napi = { version = "0.704.2", path = "../napi", optional = true }
++wasmer-webgpu = { version = "0.704", path = "../webgpu", optional = true }
+ wasmer-c-api-imports = { version = "=7.4.2", path = "../c-api-imports", optional = true, default-features = false }
+ virtual-fs = { version = "0.704.2", path = "../virtual-fs", default-features = false, features = [
+   "host-fs",
+diff --git a/lib/cli/src/commands/run/mod.rs b/lib/cli/src/commands/run/mod.rs
+index 30917bb054f..09c31ab41d6 100644
+--- a/lib/cli/src/commands/run/mod.rs
++++ b/lib/cli/src/commands/run/mod.rs
+@@ -102,6 +102,14 @@ pub struct Run {
+     /// Enable experimental N-API imports for modules that require them
+     #[clap(long = "experimental-napi")]
+     experimental_napi: bool,
++    /// Enable experimental WebGPU imports for modules that require them
++    #[clap(long = "experimental-webgpu")]
++    experimental_webgpu: bool,
++    /// What this run grants its guests of the GPU. Shared by every instance
++    /// the run creates.
++    #[cfg(feature = "webgpu")]
++    #[clap(skip)]
++    webgpu: std::sync::OnceLock<wasmer_webgpu::WebGpuCtx>,
+     /// The file, URL, or package to run.
+     #[clap(value_parser = CliPackageSource::infer)]
+     input: CliPackageSource,
+@@ -160,6 +168,69 @@ impl Run {
+     #[cfg(not(feature = "napi-v8"))]
+     fn configure_wasi_runner_for_napi(&self, _module: &Module, _runner: &mut WasiRunner) {}
+ 
++    #[cfg(feature = "webgpu")]
++    fn maybe_wrap_runtime_with_webgpu(
++        &self,
++        module: &Module,
++        runtime: Arc<dyn Runtime + Send + Sync>,
++    ) -> Result<Arc<dyn Runtime + Send + Sync>, Error> {
++        use anyhow::ensure;
++
++        if wasmer_webgpu::module_needs_webgpu(module).is_none() {
++            return Ok(runtime);
++        }
++        ensure!(
++            self.experimental_webgpu,
++            "This module imports WebGPU. Re-run with '--experimental-webgpu' to enable the experimental WebGPU runtime."
++        );
++
++        let ctx = self.webgpu.get_or_init(wasmer_webgpu::WebGpuCtx::default);
++        Ok(wrap_runtime_with_webgpu(ctx, runtime))
++    }
++
++    #[cfg(not(feature = "webgpu"))]
++    fn maybe_wrap_runtime_with_webgpu(
++        &self,
++        module: &Module,
++        runtime: Arc<dyn Runtime + Send + Sync>,
++    ) -> Result<Arc<dyn Runtime + Send + Sync>, Error> {
++        anyhow::ensure!(
++            !module
++                .imports()
++                .any(|import| import.module().starts_with("wasmer_webgpu_v")),
++            "This module imports WebGPU, which this build of Wasmer does not include."
++        );
++        Ok(runtime)
++    }
++
++    /// Runs the command with windows for the surfaces WebGPU guests present
++    /// to. Windows belong to the main thread, so the command itself moves to
++    /// another one; the window system is only started when a guest creates a
++    /// surface.
++    #[cfg(feature = "webgpu-window")]
++    fn execute_with_windows(self, output: Output) -> ! {
++        use wasmer_webgpu::window::{WindowExit, WindowHost, WindowOptions};
++
++        let host = WindowHost::with_options(WindowOptions {
++            title: self.input.to_string(),
++            ..WindowOptions::default()
++        });
++        let ctx = wasmer_webgpu::WebGpuCtx::builder()
++            .surface_provider(host.surfaces())
++            .build();
++        let control = ctx.runtime_control();
++        let _ = self.webgpu.set(ctx);
++        match host.run(move || self.execute_inner(output)) {
++            Ok(WindowExit::Finished(result)) => exit_with_wasi_exit_code(result),
++            // Closing the window is how the user quits a program that draws.
++            Ok(WindowExit::Closed) => {
++                control.terminate_all();
++                std::process::exit(0)
++            }
++            Err(error) => exit_with_wasi_exit_code(Err(error)),
++        }
++    }
++
+     #[cfg(feature = "wasm-c-api")]
+     fn module_uses_wasm_c_api(module: &Module) -> bool {
+         wasmer_c_api_imports::module_wasm_c_api_version_used(module).is_some()
+@@ -189,10 +260,11 @@ impl Run {
+         runtime: Arc<dyn Runtime + Send + Sync>,
+     ) -> Result<Arc<dyn Runtime + Send + Sync>, Error> {
+         let runtime = self.maybe_wrap_runtime_with_napi(module, runtime)?;
++        let runtime = self.maybe_wrap_runtime_with_webgpu(module, runtime)?;
+         self.maybe_wrap_runtime_with_wasm_c_api(module, runtime)
+     }
+ 
+-    #[cfg(any(feature = "napi-v8", feature = "wasm-c-api"))]
++    #[cfg(any(feature = "napi-v8", feature = "wasm-c-api", feature = "webgpu"))]
+     fn resolve_wasi_command_module(
+         &self,
+         command_name: &str,
+@@ -206,6 +278,10 @@ impl Run {
+     }
+ 
+     pub fn execute(self, output: Output) -> ! {
++        #[cfg(feature = "webgpu-window")]
++        if self.experimental_webgpu {
++            self.execute_with_windows(output)
++        }
+         let result = self.execute_inner(output);
+         exit_with_wasi_exit_code(result);
+     }
+@@ -516,22 +592,17 @@ impl Run {
+         uses: Vec<BinaryPackage>,
+         runtime: Arc<dyn Runtime + Send + Sync>,
+     ) -> Result<(), Error> {
+-        #[cfg(feature = "napi-v8")]
++        // The command's imports decide which host APIs its runtime provides.
++        #[cfg(any(feature = "napi-v8", feature = "wasm-c-api", feature = "webgpu"))]
+         let (module, runtime) = {
+             let module = self.resolve_wasi_command_module(command_name, pkg, &runtime)?;
+             let runtime = self.maybe_wrap_runtime_for_module(&module, runtime)?;
+             (module, runtime)
+         };
+ 
+-        #[cfg(all(not(feature = "napi-v8"), feature = "wasm-c-api"))]
+-        let runtime = {
+-            let module = self.resolve_wasi_command_module(command_name, pkg, &runtime)?;
+-            self.maybe_wrap_runtime_for_module(&module, runtime)?
+-        };
+-
+         // Assume webcs are always WASIX
+         let mut runner = self.build_wasi_runner(&runtime, true)?;
+-        #[cfg(feature = "napi-v8")]
++        #[cfg(any(feature = "napi-v8", feature = "wasm-c-api", feature = "webgpu"))]
+         self.configure_wasi_runner_for_napi(&module, &mut runner);
+         Runner::run_command(&mut runner, command_name, pkg, runtime)
+     }
+@@ -697,6 +768,16 @@ impl Run {
+     }
+ }
+ 
++/// Makes `runtime` provide the WebGPU imports, within what `ctx` grants, to
++/// the instances it creates for modules that import them.
++#[cfg(feature = "webgpu")]
++fn wrap_runtime_with_webgpu(
++    ctx: &wasmer_webgpu::WebGpuCtx,
++    runtime: Arc<dyn Runtime + Send + Sync>,
++) -> Arc<dyn Runtime + Send + Sync> {
++    Arc::new(OverriddenRuntime::new(runtime).with_instantiation_hook(ctx.runtime_hooks()))
++}
++
+ #[cfg(feature = "wasm-c-api")]
+ fn maybe_wrap_runtime_with_wasm_c_api(
+     module: &Module,
+@@ -925,3 +1006,87 @@ mod tests {
+         }
+     }
+ }
++
++#[cfg(all(test, feature = "webgpu"))]
++mod webgpu_tests {
++    use std::sync::Arc;
++
++    use super::*;
++    use wasmer_wasix::{
++        PluggableRuntime, WasiError, runtime::task_manager::tokio::TokioTaskManager,
++    };
++
++    /// Checks the ABI version, then creates and releases a WebGPU instance.
++    fn webgpu_guest() -> Vec<u8> {
++        wat2wasm(
++            br#"(module
++                (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
++                (import "wasmer_webgpu_v0" "wasmer_wgpu_abi_version" (func $abi_version (result i32)))
++                (import "wasmer_webgpu_v0" "wgpuCreateInstance" (func $create_instance (param i32) (result i32)))
++                (import "wasmer_webgpu_v0" "wasmer_wgpu_instance_release" (func $release_instance (param i32) (result i32)))
++
++                (memory (export "memory") 1)
++
++                (func (export "_start")
++                    (local $instance i32)
++
++                    (if (i32.shr_u (call $abi_version) (i32.const 16))
++                        (then (call $proc_exit (i32.const 10))))
++
++                    (local.set $instance (call $create_instance (i32.const 0)))
++                    (if (i32.eqz (local.get $instance))
++                        (then (call $proc_exit (i32.const 11))))
++
++                    (if (i32.ne (call $release_instance (local.get $instance)) (i32.const 1))
++                        (then (call $proc_exit (i32.const 12))))
++                )
++            )"#,
++        )
++        .expect("guest wat parses")
++        .into_owned()
++    }
++
++    #[test]
++    fn cli_webgpu_runtime_wrapper_runs_wasix_guest() {
++        let wasm = webgpu_guest();
++        let store = Store::default();
++        let module = Module::new(&store, &wasm).expect("guest module compiles");
++        assert!(wasmer_webgpu::module_needs_webgpu(&module).is_some());
++
++        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
++            .enable_all()
++            .build()
++            .expect("tokio runtime starts");
++        let _guard = tokio_runtime.enter();
++        let mut base_runtime = PluggableRuntime::new(Arc::new(TokioTaskManager::new(
++            tokio_runtime.handle().clone(),
++        )));
++        base_runtime.set_engine(store.engine().clone());
++
++        let ctx = wasmer_webgpu::WebGpuCtx::default();
++        let runtime = wrap_runtime_with_webgpu(&ctx, Arc::new(base_runtime));
++        let mut import_store = runtime.new_store();
++        let mut import_store_mut = import_store.as_store_mut();
++        let (imports, _state) = runtime
++            .additional_imports(&module, &mut import_store_mut)
++            .expect("webgpu imports are created");
++        assert!(imports.exists("wasmer_webgpu_v0", "wgpuCreateInstance"));
++
++        let result = WasiRunner::new().run_wasm(
++            RuntimeOrEngine::Runtime(runtime),
++            "webgpu-cli-smoke",
++            module,
++            ModuleHash::new(&wasm),
++        );
++
++        match result {
++            Ok(()) => {}
++            Err(err) => {
++                if let Some(WasiError::Exit(code)) = err.downcast_ref::<WasiError>() {
++                    panic!("guest exited with status {code}");
++                }
++                panic!("guest failed: {err:?}");
++            }
++        }
++    }
++}

@@ -1,0 +1,9 @@
+target/
+lib/
+tests/programs/out/
+examples/out/
+dist/
+node_modules/
+.DS_Store
+__pycache__/
+*.pyc

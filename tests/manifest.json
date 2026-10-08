@@ -1,0 +1,62 @@
+{
+  "_comment": "Conformance programs (tests/programs/<name>.c) and the exact stdout each must print. The same wasm binaries run on the native host (tests/manifest_tests.rs) and in a browser (tests/browser/run.mjs). Set \"browser\": false or \"native\": false for a program that only makes sense on one host.",
+  "tests": [
+    {
+      "name": "compute_double",
+      "stdout": "1 21 41 61 81 101 121 141 161 181 201 221 241 261 281 301\nok\n"
+    },
+    {
+      "name": "instance_info",
+      "stdout": "instance features and limits: ok\nproc table: ok\nwgsl language features: ok\nadapter: ok\ndevice limits: maxBindGroups=4 maxTextureDimension2D=8192 maxColorAttachments=8\ndevice: ok\nrequired limits and features: ok\nunsupported feature: request failed\nok\n"
+    },
+    {
+      "name": "futures",
+      "stdout": "AllowProcessEvents: delivered once by ProcessEvents\nWaitAnyOnly: delivered once by WaitAny\nAllowSpontaneous: delivered once\nWaitAny: two futures, one callback each\nWaitAny: zero futures, unknown future and zero timeout behave\ninvalid callback mode: null future\nnested requests: ok\nunreadable requests: completed with errors\nunreadable pipeline request: completed with an error\ndevice lost: destroyed\ninstance dropped: pending callback cancelled\nok\n"
+    },
+    {
+      "name": "buffer_mapping",
+      "stdout": "write mapping: two ranges written\nread mapping: window [16, 48) matches\nReadMappedRange: ok\nmappedAtCreation: ok\nmap while mapped: refused\nunmap with a map pending: handled\ndestroy: unmapped\nok\n"
+    },
+    {
+      "name": "errors",
+      "stdout": "empty scope: no error\nvalidation scope: captured\nnested scopes: error reached the matching scope\npop without push: error status\nuncaptured error: delivered to the device callback\nok\n"
+    },
+    {
+      "name": "render_triangle",
+      "stdout": "inside the triangle: 255 0 0 255\noutside the triangle: 0 0 255 255\ninside the scissor: 0 255 0 255\noutside the scissor: 0 0 255 255\nok\n"
+    },
+    {
+      "name": "render_advanced",
+      "stdout": "top left (white over red): 255 255 255 255\ntop right (red, blue hidden): 255 0 0 255\nbottom left (green, bundle): 0 255 0 255\nbottom right (green, bundle): 0 255 0 255\ncentre (clear): 0 0 0 255\nocclusion: hidden draw passed no samples, visible draw passed samples\nsampled top left: 255 0 0 255\nsampled top right: 0 255 0 255\nsampled bottom left: 0 0 255 255\nsampled bottom right: 255 255 255 255\nok\n"
+    },
+    {
+      "name": "render_rules",
+      "stdout": "transient attachment: cleared and discarded, accepted\ntransient attachment: stored, refused\ntransient attachment: loaded, refused\ntransient attachment: with another usage, refused\nmax draw count: within it, accepted\nmax draw count: exceeded, refused when the encoder is finished\nmax draw count: a bundle's draws count\nok\n"
+    },
+    {
+      "name": "textures",
+      "stdout": "texture copies: ok\nmip level 1 of layer 2: ok\nsubmitted work done: ok\nbuffer write, clear and copy: ok\nok\n"
+    },
+    {
+      "name": "pipelines_async",
+      "stdout": "valid shader: no errors\ninvalid shader: validation error with located messages\nasync compute pipeline: 7 * scale = 21\nindirect dispatch: 21 * scale = 63\nasync render pipeline: created\nasync pipeline failure: reported through the callback\nspir-v: handled as the instance features say\nok\n"
+    },
+    {
+      "name": "surface",
+      "stdout": "capabilities: ok\nunconfigured: no current texture\npresented 3 frames\nunconfigured again: no current texture\nsurface made again for the same target\nok\n"
+    },
+    {
+      "name": "labels_refs",
+      "stdout": "labels: ok\nreferences: ok\nexternal texture: nothing to create\nok\n"
+    },
+    {
+      "name": "timestamps",
+      "stdout": "pass timestamps: handled\npass timestamps into a released query set: refused\nencoder timestamp: handled\nimmediates without a slot: refused\nok\n"
+    },
+    {
+      "name": "threads",
+      "stdout": "thread 0: data ok, scope clean\nthread 1: data ok, scope caught its error\nthread 2: data ok, scope clean\nthread 3: data ok, scope caught its error\nok\n",
+      "browser": false
+    }
+  ]
+}
