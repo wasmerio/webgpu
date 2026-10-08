@@ -297,12 +297,27 @@ fn panic_message(panic: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_owned())
 }
 
+/// Whether the process whose memory this is was killed. WASIX disables the
+/// atomics of a killed process's memory to shake its threads out of their
+/// waits; a wait of no duration on an address nobody notifies tells whether
+/// that has happened, and nothing else.
+fn killed(probe: &wasmer::MemoryOps) -> bool {
+    matches!(
+        probe.wait(
+            wasmer::MemoryLocation::new_32(u32::MAX),
+            Some(std::time::Duration::ZERO)
+        ),
+        Err(wasmer::AtomicsError::AtomicsDisabled)
+    )
+}
+
 /// Runs one import: resolves the calling instance's memory and host, decodes
 /// through `f`, and turns failures into the right kind of guest-visible
 /// outcome.
 ///
 /// - A guest pointer outside linear memory traps, like the segfault it is,
 ///   whatever the implementation did with the failed copy.
+/// - A guest stopped while the call waited is stopped: the call traps.
 /// - Any other decoding error makes the call return its zero value.
 /// - A panic below (wgpu panics on a few misuse paths) traps this call
 ///   instead of unwinding through the wasm frames into the embedder.
@@ -317,8 +332,13 @@ pub(crate) fn enter<R: Default>(
             "{function}: WebGPU was called before the instance was set up"
         )));
     };
+    // Only a kill stops a call. A context shut down by its embedder
+    // (`terminate_all`) leaves its guests running, with their devices lost.
+    let probe = data.kill_probe.clone();
+    let stopped = || probe.as_ref().is_some_and(killed);
     let mut cx = Cx {
         mem: GuestMemory::new(memory.view(&store)),
+        stopped: &stopped,
     };
     let outcome = catch_unwind(AssertUnwindSafe(|| f(&host, &mut cx)));
     // Checked before anything else: an implementation may have turned a
@@ -328,7 +348,7 @@ pub(crate) fn enter<R: Default>(
     }
     match outcome {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error @ AbiError::OutOfBounds { .. })) => {
+        Ok(Err(error @ (AbiError::OutOfBounds { .. } | AbiError::Stopped))) => {
             Err(RuntimeError::new(format!("{function}: {error}")))
         }
         Ok(Err(error)) => {

@@ -92,6 +92,9 @@ mod native {
         StringTooLong,
         /// A pointer that webgpu.h does not mark `WGPU_NULLABLE` was null.
         NullPointer(&'static str),
+        /// The guest was stopped while the call waited: the call traps, so
+        /// that the guest's thread ends instead of coming back for more.
+        Stopped,
     }
 
     impl std::fmt::Display for AbiError {
@@ -108,6 +111,7 @@ mod native {
                 Self::ArrayTooLong(count) => write!(f, "array of {count} elements is too long"),
                 Self::StringTooLong => f.write_str("string is too long"),
                 Self::NullPointer(name) => write!(f, "`{name}` must not be null"),
+                Self::Stopped => f.write_str("the program was stopped"),
             }
         }
     }
@@ -177,6 +181,10 @@ mod native {
     /// Per-call context handed to every [`api`](super::api) method.
     pub struct Cx<'a> {
         pub mem: GuestMemory<'a>,
+        /// Whether the calling guest has been stopped meanwhile. A call that
+        /// waits asks between slices, and gives up with
+        /// [`AbiError::Stopped`].
+        pub stopped: &'a dyn Fn() -> bool,
     }
 
     /// Bounds-checked access to the calling instance's linear memory.

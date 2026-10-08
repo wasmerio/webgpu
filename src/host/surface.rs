@@ -442,7 +442,7 @@ impl SurfaceApi for Host {
                     ))
                 };
                 match &state.backing {
-                    Backing::Window { surface, .. } => {
+                    Backing::Window { surface, window } => {
                         use wgpu::CurrentSurfaceTexture as Current;
                         // A window nobody can see (hidden, or created a
                         // moment ago and not on screen yet) has no frame to
@@ -453,12 +453,21 @@ impl SurfaceApi for Host {
                         let mut attempt = 0;
                         let current = loop {
                             match surface.get_current_texture() {
-                                Current::Occluded if attempt < OCCLUDED_ATTEMPTS => {
+                                Current::Occluded
+                                    if attempt < OCCLUDED_ATTEMPTS && !(cx.stopped)() =>
+                                {
                                     attempt += 1;
-                                    std::thread::sleep(OCCLUDED_FRAME_DELAY);
+                                    window.wait_presentable(OCCLUDED_FRAME_DELAY);
                                 }
                                 current => break current,
                             }
+                        };
+                        // `webgpu.h` has no word for a window nobody can
+                        // see, so the log keeps the two apart.
+                        let why = match &current {
+                            Current::Occluded => "the window cannot be seen",
+                            Current::Timeout => "none became free in time",
+                            _ => "",
                         };
                         let (frame, status) = match current {
                             Current::Success(frame) => {
@@ -479,7 +488,12 @@ impl SurfaceApi for Host {
                         result.status = status;
                         if frame.is_none() {
                             super::log(|| {
-                                format!("wgpuSurfaceGetCurrentTexture: no frame ({status:?})")
+                                let why = if why.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(": {why}")
+                                };
+                                format!("wgpuSurfaceGetCurrentTexture: no frame ({status:?}{why})")
                             });
                         }
                         if let Some(frame) = frame {
@@ -538,7 +552,12 @@ impl SurfaceApi for Host {
         let index = inner.presented;
         inner.presented += 1;
         match (frame, &state.backing, &inner.configured) {
-            (CurrentFrame::Window(frame), _, Some(_)) => frame.present(),
+            (CurrentFrame::Window(frame), backing, Some(_)) => {
+                if let Backing::Window { window, .. } = backing {
+                    window.pre_present();
+                }
+                frame.present();
+            }
             (CurrentFrame::Headless(frame), Backing::Headless(sink), Some(configured)) => {
                 self.present_headless(sink.as_ref(), configured, &frame, index);
                 // Presenting consumes the frame's texture.
