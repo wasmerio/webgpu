@@ -1795,12 +1795,11 @@ export function createWebGpuHost({
   const createPipelineAsync = (event, kind, method, describeDescriptor) => (deviceHandle, descriptorPtr, future) => {
     const PipelineStatus = E.CreatePipelineAsyncStatus;
     const failure = (status, message) => ({ status, message });
-    const job = { done: false, queued: false, discarded: false, instance: null, descriptor: null, handle: 0 };
+    const job = { done: false, queued: false, discarded: false, instance: null, handle: 0 };
     pipelineJobs.add(job);
     const complete = (record) => {
       if (job.done) return;
       job.done = true;
-      job.descriptor = null;
       if (job.discarded || disposed) { pipelineJobs.delete(job); return; }
       try {
         events.push({ ...record, future, kind: event }, (discarded) => {
@@ -1825,21 +1824,20 @@ export function createWebGpuHost({
       const instanceHandle = table.instanceOf(deviceHandle);
       job.instance = table.peek(instanceHandle, 'Instance');
       if (!job.instance) throw new Invalid('The pipeline instance was released.');
-      if (device.lost || terminated) {
-        // As natively: an internal error, not the guest's mistake.
-        complete(failure(PipelineStatus.InternalError, 'The pipeline device was lost or stopped.'));
+      if (terminated) {
+        complete(failure(PipelineStatus.InternalError, 'The host was stopped.'));
         return;
       }
-      // Resolve every guest pointer before returning. The browser API snapshots
-      // the dictionary; this owned copy additionally survives through completion.
-      job.descriptor = describeDescriptor(descriptorPtr);
-      device.object[method](job.descriptor).then((pipeline) => {
+      // Every guest pointer is read here, before the call returns; the browser
+      // takes its own copy of the descriptor. A lost device doesn't fail the
+      // creation: as WebGPU says, the browser makes the pipeline, unusable.
+      device.object[method](describeDescriptor(descriptorPtr)).then((pipeline) => {
         if (job.discarded || disposed) { complete(null); return; }
         if (table.peek(instanceHandle, 'Instance') !== job.instance) {
           job.discarded = true; complete(null); return;
         }
-        if (device.lost || terminated || table.peek(deviceHandle, 'Device') !== device) {
-          complete(failure(PipelineStatus.InternalError, 'The pipeline device was lost or stopped.'));
+        if (terminated) {
+          complete(failure(PipelineStatus.InternalError, 'The host was stopped.'));
           return;
         }
         job.handle = table.insert(kind, { object: pipeline, device }, instanceHandle);

@@ -21,7 +21,6 @@ pub(super) type Outcome = Result<Object, (ErrorType, String)>;
 pub(super) struct Request {
     instance: Handle,
     instance_state: Arc<InstanceState>,
-    device_handle: Handle,
     device: Arc<DeviceState>,
     future: u64,
     kind: u32,
@@ -37,7 +36,6 @@ impl Host {
         Ok(Request {
             instance,
             instance_state,
-            device_handle: device,
             device: device_state,
             kind,
             future,
@@ -56,11 +54,11 @@ impl Host {
         let device = Arc::clone(&request.device);
         let instance = Arc::clone(&request.instance_state);
         let job = move || -> Outcome {
-            if !instance.active.load(Ordering::Acquire) || device.link.lost.load(Ordering::Acquire)
-            {
+            // Its result would be retired unpublished: don't compile it.
+            if !instance.active.load(Ordering::Acquire) {
                 return Err((
                     ErrorType::Internal,
-                    "The pipeline's device was lost.".into(),
+                    "The pipeline's instance was released.".into(),
                 ));
             }
             device.catching(create).and_then(|created| {
@@ -159,14 +157,11 @@ impl Host {
             drop(table);
             return;
         }
-        let live_device = matches!(table.get(request.device_handle), Some(Object::Device(state))
-            if Arc::ptr_eq(&state, &request.device));
-        if self.is_terminated() || !live_device || request.device.link.lost.load(Ordering::Acquire)
-        {
-            error = Some((
-                ErrorType::Internal,
-                "The pipeline's device was lost or the host was terminated.".into(),
-            ));
+        // A lost device doesn't fail the creation. As in WebGPU (and Emdawn),
+        // the pipeline is made, unusable, and the loss is reported through the
+        // device's own future.
+        if self.is_terminated() {
+            error = Some((ErrorType::Internal, "The host was terminated.".into()));
         }
         let mut handle = 0;
         if error.is_none() {
@@ -408,21 +403,38 @@ mod native_gpu_tests {
         }
     }
 
+    thread_local! {
+        /// Records a `wait` collected for other futures, kept for the waits
+        /// and drains after it.
+        static UNCLAIMED: std::cell::RefCell<Vec<Record>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Publishes what the lane has finished, and returns every record not
+    /// claimed yet.
+    fn drain(host: &Host) -> Vec<Record> {
+        host.publish_pipeline_completions();
+        let mut records = UNCLAIMED.with_borrow_mut(std::mem::take);
+        records.extend(host.events.take_for_test());
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.kind == crate::abi::EVENT_UNCAPTURED_ERROR),
+            "job failure leaked into device errors"
+        );
+        records
+    }
+
+    /// The record of `future`, once it is published. Other records are kept.
     fn wait(host: &Host, future: u64) -> Record {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let epoch = host.events.epoch();
-            host.publish_pipeline_completions();
-            let records = host.events.take_for_test();
-            assert!(
-                !records
-                    .iter()
-                    .any(|r| r.kind == crate::abi::EVENT_UNCAPTURED_ERROR),
-                "job failure leaked into device errors"
-            );
-            let matches: Vec<_> = records.into_iter().filter(|r| r.future == future).collect();
+            let (mut matches, others): (Vec<_>, Vec<_>) =
+                drain(host).into_iter().partition(|r| r.future == future);
+            UNCLAIMED.with_borrow_mut(|unclaimed| unclaimed.extend(others));
             assert!(matches.len() <= 1, "exact-once native outcome");
-            if let Some(record) = matches.into_iter().next() {
+            if let Some(record) = matches.pop() {
                 return record;
             }
             assert!(
@@ -431,6 +443,28 @@ mod native_gpu_tests {
             );
             host.events.wait_for_push(Duration::from_millis(50), epoch);
         }
+    }
+
+    /// Collects the outcome of the job `hold` ran.
+    fn retire_hold(host: &Host) {
+        let record = wait(host, HOLD_FUTURE);
+        assert_eq!(
+            record.status,
+            CreatePipelineAsyncStatus::InternalError.as_u32()
+        );
+    }
+
+    fn assert_only_the_loss_is_left(host: &Host) {
+        let kinds: Vec<_> = drain(host).iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, [crate::abi::EVENT_DEVICE_LOST]);
+    }
+
+    fn assert_published_pipeline(record: &Record) {
+        assert_eq!(
+            (record.status, record.message.as_str()),
+            (CreatePipelineAsyncStatus::Success.as_u32(), "")
+        );
+        assert_ne!(record.handle, 0);
     }
 
     #[test]
@@ -477,13 +511,8 @@ mod native_gpu_tests {
             assert!(Instant::now() < deadline);
             host.events.wait_for_push(Duration::from_millis(50), epoch);
         }
-        host.publish_pipeline_completions();
-        let records = host.events.take_for_test();
-        assert!(
-            !records
-                .iter()
-                .any(|r| r.kind == crate::abi::EVENT_UNCAPTURED_ERROR)
-        );
+        retire_hold(&host);
+        let records = drain(&host);
         for (future, kind) in [
             (1, ObjectKind::ComputePipeline),
             (2, ObjectKind::RenderPipeline),
@@ -501,8 +530,7 @@ mod native_gpu_tests {
             compute_weak.upgrade().is_none() && layout_weak.upgrade().is_none(),
             "inputs retired after compilation"
         );
-        host.publish_pipeline_completions();
-        assert!(host.events.take_for_test().is_empty());
+        assert!(drain(&host).is_empty());
     }
 
     #[test]
@@ -544,7 +572,7 @@ mod native_gpu_tests {
         }
         let wakes_before = wakes.load(Ordering::SeqCst);
         host.enqueue_compute_pipeline(device, compute_descriptor(module, 0, "main"), 2 + queued);
-        let records = host.events.take_for_test();
+        let records = drain(&host);
         assert_eq!(records.len(), 1, "only the inline creation finished");
         assert!(
             wakes.load(Ordering::SeqCst) > wakes_before,
@@ -572,7 +600,7 @@ mod native_gpu_tests {
         // The next one is compiled right here, while the lane is still held.
         let inline = queued + 1;
         host.enqueue_compute_pipeline(device, compute_descriptor(module, 0, "main"), inline);
-        let records = host.events.take_for_test();
+        let records = drain(&host);
         assert_eq!(records.len(), 1, "only the inline creation finished");
         assert_eq!(records[0].future, inline);
         assert_eq!(
@@ -582,11 +610,13 @@ mod native_gpu_tests {
         assert_ne!(records[0].handle, 0);
         host.release(records[0].handle, ObjectKind::ComputePipeline);
         release.send(()).unwrap();
+        retire_hold(&host);
         for future in 1..=queued {
             let record = wait(&host, future);
             assert_eq!(record.status, CreatePipelineAsyncStatus::Success.as_u32());
             host.release(record.handle, ObjectKind::ComputePipeline);
         }
+        assert!(drain(&host).is_empty());
     }
 
     #[test]
@@ -606,6 +636,7 @@ mod native_gpu_tests {
         host.enqueue_compute_pipeline(device, compute_descriptor(module, 0, "missing_entry"), 1);
         host.release(module, ObjectKind::ShaderModule);
         release.send(()).unwrap();
+        retire_hold(&host);
         let record = wait(&host, 1);
         assert_eq!(
             record.status,
@@ -616,16 +647,40 @@ mod native_gpu_tests {
         for _ in 0..3 {
             assert_eq!(scopes::pop(id), Some(None));
         }
-        host.publish_pipeline_completions();
-        assert!(
-            host.events.take_for_test().is_empty(),
-            "no uncaptured or duplicate outcome"
-        );
+        assert!(drain(&host).is_empty(), "no duplicate outcome");
+    }
+
+    // A lost device doesn't fail a pipeline creation, whenever the loss comes:
+    // the pipeline is published, unusable, as in WebGPU.
+
+    #[test]
+    #[ignore = "requires native GPU and exclusive serial test slot"]
+    fn a_device_lost_before_the_call_still_gets_its_pipeline() {
+        let (host, _instance, device) = fixture();
+        let module = shader(&host, device, RENDER);
+        host.device(device).unwrap().destroy();
+        host.enqueue_render_pipeline(device, render_descriptor(module, 0), 1);
+        assert_published_pipeline(&wait(&host, 1));
+        assert_only_the_loss_is_left(&host);
     }
 
     #[test]
     #[ignore = "requires native GPU and exclusive serial test slot"]
-    fn native_loss_retires_success_before_owner_publication() {
+    fn a_device_lost_while_compiling_still_gets_its_pipeline() {
+        let (host, _instance, device) = fixture();
+        let release = hold(&host, device);
+        let module = shader(&host, device, RENDER);
+        host.enqueue_render_pipeline(device, render_descriptor(module, 0), 1);
+        host.device(device).unwrap().destroy();
+        release.send(()).unwrap();
+        retire_hold(&host);
+        assert_published_pipeline(&wait(&host, 1));
+        assert_only_the_loss_is_left(&host);
+    }
+
+    #[test]
+    #[ignore = "requires native GPU and exclusive serial test slot"]
+    fn a_device_lost_before_publication_still_gets_its_pipeline() {
         let (host, _instance, device) = fixture();
         let release = hold(&host, device);
         let module = shader(&host, device, RENDER);
@@ -642,17 +697,12 @@ mod native_gpu_tests {
             host.pipelines
                 .any_completed_for_test(|request, result| request.future == 1
                     && matches!(result, Ok(Ok(Object::RenderPipeline(_))))),
-            "actual successful native result exists before loss"
+            "compiled before the loss"
         );
         host.device(device).unwrap().destroy();
-        let record = wait(&host, 1);
-        assert_eq!(
-            record.status,
-            CreatePipelineAsyncStatus::InternalError.as_u32()
-        );
-        assert_eq!(record.handle, 0);
-        host.publish_pipeline_completions();
-        assert!(!host.events.take_for_test().iter().any(|r| r.future == 1));
+        retire_hold(&host);
+        assert_published_pipeline(&wait(&host, 1));
+        assert_only_the_loss_is_left(&host);
     }
 
     #[test]
@@ -676,8 +726,13 @@ mod native_gpu_tests {
             "queued shader ownership retired immediately"
         );
         release.send(()).unwrap();
-        host.publish_pipeline_completions();
-        assert!(!host.events.take_for_test().iter().any(|r| r.future == 1));
+        // Neither the held job nor this one is published for a released instance.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while host.pipelines.is_working() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(drain(&host).is_empty());
     }
 
     #[test]
@@ -696,7 +751,6 @@ mod native_gpu_tests {
         );
         assert_eq!(record.handle, 0);
         release.send(()).unwrap();
-        host.publish_pipeline_completions();
-        assert!(!host.events.take_for_test().iter().any(|r| r.future == 1));
+        assert!(!drain(&host).iter().any(|r| r.future == 1));
     }
 }
