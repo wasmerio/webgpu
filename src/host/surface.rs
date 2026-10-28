@@ -108,6 +108,31 @@ const HEADLESS_FORMATS: [TextureFormat; 5] = [
 const OCCLUDED_FRAME_DELAY: std::time::Duration = std::time::Duration::from_millis(16);
 const OCCLUDED_ATTEMPTS: u32 = 12;
 
+/// A window's frame, from `acquire`. A window nobody can see (hidden, or
+/// created a moment ago and not on screen yet) has no frame to give, and
+/// says so at once. The wait a visible window's vsync provides is spent
+/// here instead, in `wait`: a new window gets the time to appear, and a
+/// frame loop that simply tries again does not spin. A guest stopped
+/// meanwhile stops waiting, and its call traps.
+fn window_frame(
+    cx: &Cx<'_>,
+    mut acquire: impl FnMut() -> wgpu::CurrentSurfaceTexture,
+    mut wait: impl FnMut(),
+) -> wgpu::CurrentSurfaceTexture {
+    let mut attempt = 0;
+    loop {
+        match acquire() {
+            wgpu::CurrentSurfaceTexture::Occluded
+                if attempt < OCCLUDED_ATTEMPTS && !cx.stopped() =>
+            {
+                attempt += 1;
+                wait();
+            }
+            current => break current,
+        }
+    }
+}
+
 impl Host {
     pub(crate) fn create_surface(
         &self,
@@ -442,23 +467,19 @@ impl SurfaceApi for Host {
                     ))
                 };
                 match &state.backing {
-                    Backing::Window { surface, .. } => {
+                    Backing::Window { surface, window } => {
                         use wgpu::CurrentSurfaceTexture as Current;
-                        // A window nobody can see (hidden, or created a
-                        // moment ago and not on screen yet) has no frame to
-                        // give, and says so at once. The wait a visible
-                        // window's vsync provides is spent here instead: a
-                        // new window gets the time to appear, and a frame
-                        // loop that simply tries again does not spin.
-                        let mut attempt = 0;
-                        let current = loop {
-                            match surface.get_current_texture() {
-                                Current::Occluded if attempt < OCCLUDED_ATTEMPTS => {
-                                    attempt += 1;
-                                    std::thread::sleep(OCCLUDED_FRAME_DELAY);
-                                }
-                                current => break current,
-                            }
+                        let current = window_frame(
+                            cx,
+                            || surface.get_current_texture(),
+                            || window.wait_presentable(OCCLUDED_FRAME_DELAY),
+                        );
+                        // `webgpu.h` has no word for a window nobody can
+                        // see, so the log keeps the two apart.
+                        let why = match &current {
+                            Current::Occluded => "the window cannot be seen",
+                            Current::Timeout => "none became free in time",
+                            _ => "",
                         };
                         let (frame, status) = match current {
                             Current::Success(frame) => {
@@ -479,7 +500,12 @@ impl SurfaceApi for Host {
                         result.status = status;
                         if frame.is_none() {
                             super::log(|| {
-                                format!("wgpuSurfaceGetCurrentTexture: no frame ({status:?})")
+                                let why = if why.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(": {why}")
+                                };
+                                format!("wgpuSurfaceGetCurrentTexture: no frame ({status:?}{why})")
                             });
                         }
                         if let Some(frame) = frame {
@@ -538,7 +564,12 @@ impl SurfaceApi for Host {
         let index = inner.presented;
         inner.presented += 1;
         match (frame, &state.backing, &inner.configured) {
-            (CurrentFrame::Window(frame), _, Some(_)) => frame.present(),
+            (CurrentFrame::Window(frame), backing, Some(_)) => {
+                if let Backing::Window { window, .. } = backing {
+                    window.pre_present();
+                }
+                frame.present();
+            }
             (CurrentFrame::Headless(frame), Backing::Headless(sink), Some(configured)) => {
                 self.present_headless(sink.as_ref(), configured, &frame, index);
                 // Presenting consumes the frame's texture.
@@ -583,5 +614,57 @@ impl SurfaceApi for Host {
         let ok = (width == 0 || cx.mem.write_u32(width, w).is_ok())
             && (height == 0 || cx.mem.write_u32(height, h).is_ok());
         if ok { Status::Success } else { Status::Error }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::GuestMemory;
+    use std::cell::Cell;
+    use wgpu::CurrentSurfaceTexture::Occluded;
+
+    /// Runs `f` with a call context whose guest is stopped from the check
+    /// after `checks_before_stop` on.
+    fn with_cx(checks_before_stop: u32, f: impl FnOnce(&Cx<'_>)) {
+        let mut store = wasmer::Store::default();
+        let memory =
+            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false)).unwrap();
+        let checks = Cell::new(0);
+        let stopped = || {
+            checks.set(checks.get() + 1);
+            checks.get() > checks_before_stop
+        };
+        f(&Cx::new(GuestMemory::new(memory.view(&store)), &stopped));
+    }
+
+    #[test]
+    fn an_occluded_window_is_asked_again_a_few_times() {
+        with_cx(u32::MAX, |cx| {
+            let (mut asked, mut waited) = (0, 0);
+            let frame = window_frame(
+                cx,
+                || {
+                    asked += 1;
+                    Occluded
+                },
+                || waited += 1,
+            );
+            assert!(matches!(frame, Occluded));
+            assert_eq!((asked, waited), (OCCLUDED_ATTEMPTS + 1, OCCLUDED_ATTEMPTS));
+            assert!(!cx.take_stop(), "a guest that wasn't stopped doesn't trap");
+        });
+    }
+
+    #[test]
+    fn a_guest_stopped_while_its_window_is_occluded_stops_waiting_and_traps() {
+        with_cx(2, |cx| {
+            let mut waited = 0;
+            let frame = window_frame(cx, || Occluded, || waited += 1);
+            assert!(matches!(frame, Occluded));
+            assert_eq!(waited, 2, "no wait after the check that saw the stop");
+            assert!(cx.take_stop(), "the call traps when it returns");
+            assert!(!cx.take_stop(), "the stop is taken once");
+        });
     }
 }

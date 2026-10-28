@@ -12,6 +12,10 @@ pub struct WebGpuEnv {
     /// what lets a handle created on one guest thread work on another.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) host: Option<Arc<crate::host::Host>>,
+    /// How to tell that the process was killed, where the runtime lets that
+    /// be seen on its memory (see `host::killed`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) kill_probe: Option<wasmer::MemoryOps>,
     /// The JavaScript host whose functions are this instance's imports. Held
     /// here so that it lives exactly as long as the instance.
     #[cfg(all(target_arch = "wasm32", feature = "js"))]
@@ -24,6 +28,8 @@ impl WebGpuEnv {
             memory: None,
             #[cfg(not(target_arch = "wasm32"))]
             host: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            kill_probe: None,
             #[cfg(all(target_arch = "wasm32", feature = "js"))]
             js_host: None,
         }

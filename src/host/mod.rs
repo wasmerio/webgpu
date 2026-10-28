@@ -6,6 +6,7 @@
 //! own file implementing the matching generated `*Api` trait.
 
 mod adapter;
+mod async_pipeline;
 mod bind;
 mod buffer;
 mod convert;
@@ -15,6 +16,7 @@ mod events;
 mod instance;
 mod pass;
 mod pipeline;
+mod pipeline_worker;
 mod queue;
 mod scopes;
 mod shader;
@@ -22,6 +24,7 @@ mod shim;
 mod surface;
 mod table;
 mod texture;
+mod upload;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -71,6 +74,10 @@ pub(crate) fn log(message: impl FnOnce() -> String) {
 /// Futureless events (uncaptured errors) kept for a guest that does not
 /// collect them, unless the embedder says otherwise.
 const DEFAULT_MAX_PENDING_EVENTS: usize = 4096;
+/// Async pipeline creations a process's compiler lane holds at once: queued,
+/// compiling, or finished but not collected yet. Beyond it, a creation is
+/// compiled on the calling thread.
+const PIPELINE_LANE_CAPACITY: usize = 64;
 
 /// What the embedder-facing context needs from a guest process's host.
 pub(crate) trait HostControl: Any + Send + Sync {
@@ -110,22 +117,33 @@ pub(crate) struct Host {
     next_device_id: AtomicU64,
     /// Bytes of buffer and texture storage currently allocated.
     pub(crate) gpu_memory: Arc<AtomicU64>,
+    /// What the staging buffers of large texture uploads may hold.
+    pub(crate) staging: Arc<upload::StagingBudget>,
     terminated: AtomicBool,
+    pipelines: pipeline_worker::Worker<async_pipeline::Request, async_pipeline::Outcome>,
 }
 
 impl Host {
     fn new(ctx: Arc<CtxInner>) -> Self {
-        let events = Arc::new(Events::new(
+        let events = Arc::new(Events::with_waker(
             ctx.limits
                 .max_pending_events
                 .or(Some(DEFAULT_MAX_PENDING_EVENTS)),
+            ctx.event_waker.clone(),
         ));
+        let notify = Arc::clone(&events);
+        let pipelines = pipeline_worker::Worker::new(
+            PIPELINE_LANE_CAPACITY,
+            Arc::new(move || notify.notify_work()),
+        );
         Self {
             table: Mutex::new(table::Table::new(ctx.limits.max_objects)),
+            pipelines,
             events,
             devices: Mutex::new(Vec::new()),
             next_device_id: AtomicU64::new(1),
             gpu_memory: Arc::new(AtomicU64::new(0)),
+            staging: Arc::new(upload::StagingBudget::new(ctx.limits.max_gpu_memory_bytes)),
             terminated: AtomicBool::new(ctx.stopped.load(Ordering::Acquire)),
             ctx,
         }
@@ -165,6 +183,7 @@ impl Host {
     /// Stops the process's GPU work: wakes waiters and destroys every device.
     pub(crate) fn terminate(&self) {
         self.terminated.store(true, Ordering::Release);
+        self.pipelines.terminate();
         for device in self.live_devices() {
             device.destroy();
         }
@@ -248,6 +267,15 @@ impl Host {
     }
 }
 
+impl Drop for Host {
+    fn drop(&mut self) {
+        // Worker::drop is nonblocking and owns no Host/guest state. Its native
+        // inputs survive until any in-flight driver call exits and discards.
+        self.terminated.store(true, Ordering::Release);
+        self.pipelines.close();
+    }
+}
+
 impl HostControl for Host {
     fn terminate(&self) {
         Host::terminate(self);
@@ -297,12 +325,28 @@ fn panic_message(panic: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_owned())
 }
 
+/// Whether the process whose memory this is was killed. WASIX disables the
+/// atomics of a killed process's memory to shake its threads out of their
+/// waits; a wait of no duration on an address nobody notifies tells whether
+/// that has happened, and nothing else.
+fn killed(probe: &wasmer::MemoryOps) -> bool {
+    matches!(
+        probe.wait(
+            wasmer::MemoryLocation::new_32(u32::MAX),
+            Some(std::time::Duration::ZERO)
+        ),
+        Err(wasmer::AtomicsError::AtomicsDisabled)
+    )
+}
+
 /// Runs one import: resolves the calling instance's memory and host, decodes
 /// through `f`, and turns failures into the right kind of guest-visible
 /// outcome.
 ///
 /// - A guest pointer outside linear memory traps, like the segfault it is,
 ///   whatever the implementation did with the failed copy.
+/// - A guest stopped while the call waited is stopped: the call traps, as
+///   soon as the call saw it, whatever the call returned.
 /// - Any other decoding error makes the call return its zero value.
 /// - A panic below (wgpu panics on a few misuse paths) traps this call
 ///   instead of unwinding through the wasm frames into the embedder.
@@ -317,18 +361,38 @@ pub(crate) fn enter<R: Default>(
             "{function}: WebGPU was called before the instance was set up"
         )));
     };
-    let mut cx = Cx {
-        mem: GuestMemory::new(memory.view(&store)),
-    };
+    // Only a kill stops a call. A context shut down by its embedder
+    // (`terminate_all`) leaves its guests running, with their devices lost.
+    let probe = data.kill_probe.clone();
+    let stopped = || probe.as_ref().is_some_and(killed);
+    let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
     let outcome = catch_unwind(AssertUnwindSafe(|| f(&host, &mut cx)));
+    finish(&host, function, &cx, outcome)
+}
+
+/// What a call that ran becomes for the guest; see [`enter`].
+fn finish<R: Default>(
+    host: &Host,
+    function: &'static str,
+    cx: &Cx<'_>,
+    outcome: std::thread::Result<AbiResult<R>>,
+) -> Result<R, RuntimeError> {
     // Checked before anything else: an implementation may have turned a
     // failed copy into a status of its own, and a wild pointer still traps.
     if let Some(fault) = cx.mem.take_fault() {
         return Err(RuntimeError::new(format!("{function}: {fault}")));
     }
+    // Likewise a call that found its guest stopped, even one that went on to
+    // return a status or nothing at all.
+    if cx.take_stop() {
+        return Err(RuntimeError::new(format!(
+            "{function}: {}",
+            AbiError::Stopped
+        )));
+    }
     match outcome {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error @ AbiError::OutOfBounds { .. })) => {
+        Ok(Err(error @ (AbiError::OutOfBounds { .. } | AbiError::Stopped))) => {
             Err(RuntimeError::new(format!("{function}: {error}")))
         }
         Ok(Err(error)) => {
@@ -342,6 +406,44 @@ pub(crate) fn enter<R: Default>(
                 "{function}: the WebGPU backend failed: {message}"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    fn with_cx(stopped: bool, f: impl FnOnce(&Host, &Cx<'_>)) {
+        let host = Host::new(Arc::clone(&crate::WebGpuCtx::default().inner));
+        let mut store = wasmer::Store::default();
+        let memory =
+            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false)).unwrap();
+        let stopped = move || stopped;
+        f(
+            &host,
+            &Cx::new(GuestMemory::new(memory.view(&store)), &stopped),
+        );
+    }
+
+    #[test]
+    fn a_call_that_saw_its_guest_stopped_traps_whatever_it_returned() {
+        with_cx(true, |host, cx| {
+            assert!(cx.stopped());
+            let error = finish(host, "wgpuTest", cx, Ok(Ok(7))).expect_err("traps");
+            assert!(error.to_string().contains("stopped"), "{error}");
+        });
+    }
+
+    #[test]
+    fn a_call_that_never_asked_returns_what_it_returned() {
+        // Only a check that sees the stop makes the call trap.
+        with_cx(true, |host, cx| {
+            assert_eq!(finish(host, "wgpuTest", cx, Ok(Ok(7))).unwrap(), 7);
+        });
+        with_cx(false, |host, cx| {
+            assert!(!cx.stopped());
+            assert_eq!(finish(host, "wgpuTest", cx, Ok(Ok(7))).unwrap(), 7);
+        });
     }
 }
 

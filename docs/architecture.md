@@ -144,7 +144,8 @@ the device's lost future).
 ### Waiting
 
 `wgpuInstanceWaitAny` is a futex-style wait. The host keeps an event
-**epoch** that changes whenever a record is queued. The shim reads the
+**epoch** that changes whenever a record is queued, or a compiled pipeline
+is ready to be published (see below). The shim reads the
 epoch, looks at what it already has, and only then waits, passing the epoch
 it saw: the host returns immediately if the epoch has moved. That closes the
 window in which one guest thread collects a record another thread is
@@ -158,6 +159,18 @@ loop is free meanwhile, which is the only time a browser delivers anything.
 For the same reason `wgpuInstanceProcessEvents` and a zero-timeout
 `wgpuInstanceWaitAny` yield once when work is outstanding: a program that
 polls in a loop still makes progress.
+
+### Async pipelines
+
+Natively, `wgpuDeviceCreate{Compute,Render}PipelineAsync` resolves the
+objects its descriptor names into an owned job and hands it to a compiler
+thread, one per guest process. The result is published (the pipeline
+registered, its record queued) the next time a guest thread polls or waits,
+and the epoch changes as soon as it is ready, so that a waiting thread looks
+again. While a pipeline compiles, a waiting thread that would otherwise block
+inside a busy GPU polls it in short slices instead. A lane at capacity hands
+the job back, and the call compiles it on the guest's thread. The browser
+compiles with the browser's own asynchronous calls.
 
 ## Buffer mapping
 

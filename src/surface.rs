@@ -42,6 +42,22 @@ pub trait WindowTarget: HasWindowHandle + HasDisplayHandle + Send + Sync + 'stat
     fn run_on_owner_thread(&self, work: Box<dyn FnOnce() + Send>) {
         work()
     }
+
+    /// Called on the guest's thread right before each frame is handed to the
+    /// window system. Some window systems pace a window's redraws by being
+    /// told of its presents (winit's `Window::pre_present_notify`). The
+    /// default does nothing.
+    fn pre_present(&self) {}
+
+    /// Called on the guest's thread when the window had no frame to give
+    /// because nothing of it can be seen (it is hidden, covered, or behind a
+    /// locked screen). Returns when asking again may be worth it, and after
+    /// `timeout` at the latest. A window that knows more than the GPU does
+    /// can return early, or tell its guest that it cannot be seen. The
+    /// default sleeps for `timeout`.
+    fn wait_presentable(&self, timeout: std::time::Duration) {
+        std::thread::sleep(timeout);
+    }
 }
 
 /// Pixel layout of a [`Frame`]: four 8-bit channels per pixel, rows top to

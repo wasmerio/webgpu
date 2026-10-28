@@ -25,6 +25,9 @@ use crate::abi::{
 /// Longest a waiting thread sleeps before it looks again for termination and
 /// for events completed by another thread.
 const WAIT_SLICE: Duration = Duration::from_millis(20);
+/// How long a wait blocks between polls of a busy GPU while a pipeline
+/// compiles: the compiler thread can't end a wait inside the GPU.
+const COMPILING_WAIT_SLICE: Duration = Duration::from_millis(1);
 
 /// Copies `bytes` to the guest if they fit. Returns the size either way, so
 /// the shim can retry with a buffer that is large enough.
@@ -65,7 +68,9 @@ impl Host {
     /// into events here. Returns whether any device still has work in flight.
     fn poll_devices(&self, wait: Option<Duration>) -> bool {
         let mut busy = false;
+        let now = Instant::now();
         for device in self.live_devices() {
+            device.uploads.trim(now);
             let poll = match wait {
                 Some(timeout) => wgpu::PollType::Wait {
                     submission_index: None,
@@ -155,8 +160,14 @@ impl Host {
         let adapter = self
             .adapter(adapter)
             .ok_or_else(|| "Invalid adapter.".to_owned())?;
+        // A destroyed device may live on in queued work: it doesn't count.
         if let Some(max) = self.ctx.limits.max_devices
-            && self.live_devices().len() >= max
+            && self
+                .live_devices()
+                .iter()
+                .filter(|device| !device.link.lost.load(std::sync::atomic::Ordering::Acquire))
+                .count()
+                >= max
         {
             return Err(format!("This guest may have at most {max} devices."));
         }
@@ -380,13 +391,7 @@ impl ShimApi for Host {
                 .read_required::<ComputePipelineDescriptor>(descriptor, "descriptor"),
         )?;
         match descriptor {
-            Ok(descriptor) => self.finish_pipeline_async(
-                EVENT_CREATE_COMPUTE_PIPELINE,
-                ObjectKind::ComputePipeline,
-                future,
-                self.device(device).as_deref(),
-                || self.create_compute_pipeline(device, &descriptor),
-            ),
+            Ok(descriptor) => self.enqueue_compute_pipeline(device, descriptor, future),
             Err(message) => {
                 self.fail_pipeline_async(EVENT_CREATE_COMPUTE_PIPELINE, future, message)
             }
@@ -407,13 +412,7 @@ impl ShimApi for Host {
                 .read_required::<RenderPipelineDescriptor>(descriptor, "descriptor"),
         )?;
         match descriptor {
-            Ok(descriptor) => self.finish_pipeline_async(
-                EVENT_CREATE_RENDER_PIPELINE,
-                ObjectKind::RenderPipeline,
-                future,
-                self.device(device).as_deref(),
-                || self.create_render_pipeline(device, &descriptor),
-            ),
+            Ok(descriptor) => self.enqueue_render_pipeline(device, descriptor, future),
             Err(message) => self.fail_pipeline_async(EVENT_CREATE_RENDER_PIPELINE, future, message),
         }
         Ok(())
@@ -440,7 +439,9 @@ impl ShimApi for Host {
     }
 
     fn wasmer_wgpu_poll(&self, cx: &mut Cx<'_>, buf: u32, cap: u32) -> AbiResult<i32> {
+        self.publish_pipeline_completions();
         self.poll_devices(None);
+        self.publish_pipeline_completions();
         self.events.drain_into(&cx.mem, buf, cap)
     }
 
@@ -462,7 +463,9 @@ impl ShimApi for Host {
         // A timeout too large to add to the clock is "forever".
         let deadline = Instant::now().checked_add(Duration::from_nanos(timeout_ns));
         loop {
+            self.publish_pipeline_completions();
             self.poll_devices(None);
+            self.publish_pipeline_completions();
             // An event queued since the caller last looked may be the one it
             // waits for, already collected by another guest thread: let the
             // caller look again rather than sleep on a queue that will not
@@ -472,6 +475,11 @@ impl ShimApi for Host {
                 || self.is_terminated()
             {
                 break;
+            }
+            // A killed guest would otherwise wait here for as long as it
+            // asked to, and for ever if that is what it asked.
+            if cx.stopped() {
+                return Err(AbiError::Stopped);
             }
             let remaining = match deadline {
                 Some(deadline) => deadline.saturating_duration_since(Instant::now()),
@@ -483,8 +491,16 @@ impl ShimApi for Host {
             let slice = remaining.min(WAIT_SLICE);
             // Block where progress will come from: in the GPU while it has
             // work in flight, otherwise until another thread queues an event.
-            if !self.poll_devices(Some(slice)) {
-                self.events.wait_for_push(slice);
+            // While a pipeline compiles, progress may come from both.
+            if self.pipelines.is_working() {
+                let slice = if self.poll_devices(None) {
+                    slice.min(COMPILING_WAIT_SLICE)
+                } else {
+                    slice
+                };
+                self.events.wait_for_push(slice, epoch);
+            } else if !self.poll_devices(Some(slice)) {
+                self.events.wait_for_push(slice, epoch);
             }
         }
         self.events.drain_into(&cx.mem, buf, cap)
@@ -498,9 +514,14 @@ impl ShimApi for Host {
     }
 
     fn wasmer_wgpu_instance_release(&self, _cx: &mut Cx<'_>, instance: u32) -> AbiResult<i32> {
-        Ok(i32::from(
-            self.release(instance, ObjectKind::Instance).is_some(),
-        ))
+        let removed = self.release(instance, ObjectKind::Instance);
+        if let Some(Object::Instance(state)) = &removed {
+            state
+                .active
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.discard_pipeline_instance(instance);
+        }
+        Ok(i32::from(removed.is_some()))
     }
 
     fn wasmer_wgpu_buffer_release(&self, _cx: &mut Cx<'_>, buffer: u32) -> AbiResult<i32> {

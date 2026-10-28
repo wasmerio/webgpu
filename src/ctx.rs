@@ -23,7 +23,9 @@ pub struct WebGpuLimits {
     /// Completed events the guest has not collected yet. Beyond it, further
     /// uncaptured errors are dropped (and counted) rather than queued.
     pub max_pending_events: Option<usize>,
-    /// Bytes of buffer and texture storage the guest may have allocated.
+    /// Bytes of buffer and texture storage the guest may have allocated. The
+    /// staging buffers the host keeps for large texture uploads don't count:
+    /// they hold at most 64 MiB per guest, and no more than this.
     pub max_gpu_memory_bytes: Option<u64>,
 }
 
@@ -46,6 +48,8 @@ pub struct WebGpuCtxBuilder {
     force_fallback_adapter: bool,
     #[cfg(not(target_arch = "wasm32"))]
     surfaces: Option<Arc<dyn crate::surface::SurfaceProvider>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    event_waker: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(target_arch = "wasm32")]
     canvas_scope: u32,
 }
@@ -85,6 +89,22 @@ impl WebGpuCtxBuilder {
         self
     }
 
+    /// Called whenever an event becomes ready for a guest of this context, so
+    /// an embedder whose own loop waits on something else (window events, for
+    /// example) can wake it. The guest still collects the event the usual way,
+    /// by polling.
+    ///
+    /// It runs on whichever thread made the event ready, sometimes while that
+    /// thread holds locks of this crate, so it must only signal. It may not
+    /// call back into WebGPU, the store or the guest, nor wait for anything a
+    /// thread inside WebGPU might hold: a lock such a thread takes, or a
+    /// bounded channel it drains. Hold only weak references to what it wakes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn event_waker(mut self, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.event_waker = Some(wake);
+        self
+    }
+
     /// Names the set of canvases the guests of this context may draw to.
     ///
     /// In a browser a guest runs in a web worker, and the canvases it presents
@@ -110,6 +130,8 @@ impl WebGpuCtxBuilder {
                     .unwrap_or_else(|| Arc::new(crate::surface::HeadlessSurfaces::default())),
                 #[cfg(not(target_arch = "wasm32"))]
                 hosts: Mutex::new(crate::host::HostRegistry::default()),
+                #[cfg(not(target_arch = "wasm32"))]
+                event_waker: self.event_waker,
                 #[cfg(target_arch = "wasm32")]
                 canvas_scope: self.canvas_scope,
                 stopped: AtomicBool::new(false),
@@ -126,6 +148,8 @@ pub(crate) struct CtxInner {
     /// Host state of every live guest process started through this context.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) hosts: Mutex<crate::host::HostRegistry>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) event_waker: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(target_arch = "wasm32")]
     #[cfg_attr(not(feature = "js"), allow(dead_code))]
     pub(crate) canvas_scope: u32,
@@ -326,9 +350,11 @@ impl WebGpuRuntimeHooks {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let host = crate::host::Host::for_memory(&self.ctx, store, &memory);
+            let kill_probe = memory.as_shared(store).map(|shared| shared.ops());
             let data = env.as_mut(store);
             data.memory = Some(memory);
             data.host = Some(host);
+            data.kill_probe = kill_probe;
         }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         {
