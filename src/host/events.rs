@@ -38,6 +38,11 @@ pub(crate) struct Record {
     pub aux: u32,
     pub message: String,
     pub extra: Vec<u8>,
+    // Host-only, absent from the wire format: the compiler lane admission an
+    // async pipeline's event holds until the guest collects it (only its Drop
+    // matters), and the instance whose release retires the event.
+    pub(super) _pipeline_slot: Option<Arc<super::pipeline_worker::Slot>>,
+    pub(super) pipeline_instance: u32,
 }
 
 fn pad8(len: usize) -> usize {
@@ -75,7 +80,6 @@ pub(crate) struct Events {
     /// about to block compares this with what it saw before it looked for
     /// its events: any change means another thread may have collected them.
     epoch: AtomicU64,
-    /// The embedder's waker (`WebGpuCtxBuilder::event_waker`), if any.
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -110,6 +114,16 @@ impl Events {
     /// (uncaptured errors) are dropped once the queue is over its limit, so a
     /// guest that never polls cannot grow host memory without bound.
     pub(crate) fn push(&self, record: Record) {
+        if self.queue(record) {
+            self.wake_owner();
+        }
+    }
+
+    /// Like [`push`](Self::push), but leaves waking the embedder to the
+    /// caller, who calls [`wake_owner`](Self::wake_owner) once it released its
+    /// own locks. Guest threads waiting for an event are woken. Returns
+    /// whether the record was queued.
+    pub(crate) fn queue(&self, record: Record) -> bool {
         let mut ready = self.lock();
         if record.future == 0
             && self
@@ -117,24 +131,55 @@ impl Events {
                 .is_some_and(|max_pending| ready.len() >= max_pending)
         {
             self.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         ready.push_back(record);
         self.epoch.fetch_add(1, Ordering::Release);
         drop(ready);
-        self.notify_owner();
+        self.pushed.notify_all();
+        true
     }
 
-    fn notify_owner(&self) {
-        self.pushed.notify_all();
+    /// Calls the embedder's event waker, if it has one.
+    pub(crate) fn wake_owner(&self) {
         if let Some(wake) = &self.wake {
             // Embedder signaling must not strand GPU futures if it panics.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wake()));
         }
     }
 
+    /// Owned compiler results are ready; publication happens on the next import.
+    pub(crate) fn notify_work(&self) {
+        let ready = self.lock();
+        self.epoch.fetch_add(1, Ordering::Release);
+        drop(ready);
+        self.pushed.notify_all();
+        self.wake_owner();
+    }
+
+    pub(crate) fn retire_pipeline_instance(&self, instance: u32) -> Vec<Record> {
+        let mut ready = self.lock();
+        let mut retained = VecDeque::new();
+        let mut retired = Vec::new();
+        for record in ready.drain(..) {
+            // Only async pipeline events name an instance (handles start at 1).
+            if record.pipeline_instance == instance {
+                retired.push(record);
+            } else {
+                retained.push_back(record);
+            }
+        }
+        *ready = retained;
+        retired
+    }
+
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_for_test(&self) -> Vec<Record> {
+        self.lock().drain(..).collect()
     }
 
     pub(crate) fn is_ready(&self, futures: &[u64]) -> bool {
@@ -144,9 +189,9 @@ impl Events {
     }
 
     /// Sleeps until an event is queued or `timeout` passes.
-    pub(crate) fn wait_for_push(&self, timeout: Duration) {
+    pub(crate) fn wait_for_push(&self, timeout: Duration, epoch: u64) {
         let ready = self.lock();
-        if !ready.is_empty() {
+        if !ready.is_empty() || self.epoch() != epoch {
             return;
         }
         let _ = self
@@ -156,7 +201,7 @@ impl Events {
     }
 
     pub(crate) fn wake_all(&self) {
-        self.pushed.notify_all();
+        self.notify_work();
     }
 
     /// Moves as many whole records as fit into the guest buffer.
@@ -196,6 +241,7 @@ mod tests {
             aux: 5,
             message: "abc".into(),
             extra: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            ..Record::default()
         };
         let bytes = record.encode();
         assert_eq!(bytes.len(), 32 + 8 + 16);
@@ -225,6 +271,26 @@ mod tests {
     }
 
     #[test]
+    fn compiler_notification_before_wait_registration_is_not_lost() {
+        let events = Events::new(None);
+        let before = events.epoch();
+        events.notify_work();
+        // An already queued compiler notification must not sleep for the
+        // timeout, even though no ordinary event record exists yet.
+        let started = std::time::Instant::now();
+        events.wait_for_push(Duration::from_secs(2), before);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "did not sleep for stale epoch"
+        );
+        assert_ne!(events.epoch(), before);
+        assert!(
+            events.lock().is_empty(),
+            "notification does not forge a future"
+        );
+    }
+
+    #[test]
     fn waker_runs_after_event_mutex_is_released() {
         let weak = std::sync::OnceLock::<std::sync::Weak<Events>>::new();
         let shared = Arc::new(weak);
@@ -240,6 +306,8 @@ mod tests {
         ));
         assert!(shared.set(Arc::downgrade(&events)).is_ok());
         events.push(Record::default());
+        assert!(observed.swap(false, Ordering::AcqRel));
+        events.notify_work();
         assert!(observed.load(Ordering::Acquire));
     }
 }

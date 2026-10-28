@@ -133,16 +133,27 @@ impl DeviceState {
         );
     }
 
-    /// Runs `f` and reports whether it raised an error on this thread, which
-    /// is how pipeline creation gets a status to hand to an async callback.
-    pub(crate) fn catching<R>(&self, f: impl FnOnce() -> R) -> (R, Option<(ErrorType, String)>) {
-        scopes::push(self.id(), ErrorFilter::Internal);
-        scopes::push(self.id(), ErrorFilter::Validation);
-        let value = f();
-        let validation = scopes::pop(self.id()).flatten();
-        let internal = scopes::pop(self.id()).flatten();
-        (value, validation.or(internal))
+    /// Runs `f` under error scopes of its own, out-of-memory included, so no
+    /// error it raises reaches the guest: how an async pipeline creation gets
+    /// the outcome for its callback. The scopes are popped even after a
+    /// panic, so one call can't leave them to the next on the same thread.
+    pub(crate) fn catching<R>(&self, f: impl FnOnce() -> R) -> Result<R, (ErrorType, String)> {
+        capture_errors(self.id(), f)
     }
+}
+
+fn capture_errors<R>(id: u64, f: impl FnOnce() -> R) -> Result<R, (ErrorType, String)> {
+    scopes::push(id, ErrorFilter::OutOfMemory);
+    scopes::push(id, ErrorFilter::Internal);
+    scopes::push(id, ErrorFilter::Validation);
+    let value = super::catch_expected_panic(f);
+    let validation = scopes::pop(id).flatten();
+    let internal = scopes::pop(id).flatten();
+    let oom = scopes::pop(id).flatten();
+    if let Some(error) = oom.or(internal).or(validation) {
+        return Err(error);
+    }
+    value.map_err(|message| (ErrorType::Internal, message))
 }
 
 impl Drop for DeviceState {
@@ -324,5 +335,35 @@ impl DeviceApi for Host {
 
     fn device_add_ref(&self, _cx: &mut Cx<'_>, device: Handle) {
         self.add_ref(device, ObjectKind::Device);
+    }
+}
+
+#[cfg(test)]
+mod catching_tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_job_captures_all_error_classes_without_touching_caller_scope() {
+        scopes::push(111, ErrorFilter::Validation);
+        for ty in [
+            ErrorType::Validation,
+            ErrorType::Internal,
+            ErrorType::OutOfMemory,
+        ] {
+            let result = capture_errors(111, || {
+                assert!(scopes::capture(111, ty, "job-local error"));
+                7
+            });
+            assert_eq!(result, Err((ty, "job-local error".into())));
+        }
+        assert_eq!(scopes::pop(111), Some(None));
+        assert_eq!(scopes::pop(111), None);
+    }
+
+    #[test]
+    fn panic_does_not_leave_scopes_for_the_next_job() {
+        assert!(capture_errors(112, || panic!("injected driver panic")).is_err());
+        assert_eq!(scopes::pop(112), None);
+        assert_eq!(capture_errors(112, || 42), Ok(42));
     }
 }

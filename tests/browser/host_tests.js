@@ -408,6 +408,54 @@ const TESTS = {
     }
   },
 
+  async 'an async pipeline whose instance was released publishes nothing'(guest) {
+    const { instance, device } = await guest.device();
+    const { imports, view } = guest;
+    const source = guest.alloc(S.WGPUShaderSourceWGSL.__size);
+    view.setUint32(source + S.WGPUChainedStruct.sType, STYPE.ShaderSourceWGSL, true);
+    guest.stringView(source + S.WGPUShaderSourceWGSL.code, '@compute @workgroup_size(1) fn main() {}');
+    const moduleDescriptor = guest.alloc(S.WGPUShaderModuleDescriptor.__size);
+    view.setUint32(moduleDescriptor + S.WGPUShaderModuleDescriptor.nextInChain, source, true);
+    const module = imports.wgpuDeviceCreateShaderModule(device, moduleDescriptor);
+    const C = S.WGPUComputePipelineDescriptor;
+    const descriptor = guest.alloc(C.__size);
+    view.setUint32(descriptor + C.compute + S.WGPUComputeState.module, module, true);
+    view.setUint32(descriptor + C.compute + S.WGPUComputeState.entryPoint + S.WGPUStringView.length, U32_MAX, true);
+    const create = (future) => imports.wasmer_wgpu_device_create_compute_pipeline_async(device, descriptor, future);
+    const control = await guest.complete(create);
+    equal(control.status, E.CreatePipelineAsyncStatus.Success, 'a pipeline of a live instance');
+    // The browser compiles this one after its instance is gone.
+    const future = ++guest.future;
+    create(future);
+    check(imports.wasmer_wgpu_instance_release(instance) === 1, 'the instance was not released');
+    // Long enough for the browser to finish, as it did the first one.
+    for (let turn = 0; turn < 20; turn++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      check(!guest.records().some((record) => record.future === future),
+        'a pipeline of a released instance was published');
+    }
+  },
+
+  async 'an async pipeline of a lost device is an internal error, as natively'(guest) {
+    const { device } = await guest.device();
+    const { imports, view } = guest;
+    const source = guest.alloc(S.WGPUShaderSourceWGSL.__size);
+    view.setUint32(source + S.WGPUChainedStruct.sType, STYPE.ShaderSourceWGSL, true);
+    guest.stringView(source + S.WGPUShaderSourceWGSL.code, '@compute @workgroup_size(1) fn main() {}');
+    const moduleDescriptor = guest.alloc(S.WGPUShaderModuleDescriptor.__size);
+    view.setUint32(moduleDescriptor + S.WGPUShaderModuleDescriptor.nextInChain, source, true);
+    const module = imports.wgpuDeviceCreateShaderModule(device, moduleDescriptor);
+    const C = S.WGPUComputePipelineDescriptor;
+    const descriptor = guest.alloc(C.__size);
+    view.setUint32(descriptor + C.compute + S.WGPUComputeState.module, module, true);
+    view.setUint32(descriptor + C.compute + S.WGPUComputeState.entryPoint + S.WGPUStringView.length, U32_MAX, true);
+    imports.wgpuDeviceDestroy(device);
+    const record = await guest.complete(
+      (future) => imports.wasmer_wgpu_device_create_compute_pipeline_async(device, descriptor, future),
+    );
+    equal([record.status, record.handle], [E.CreatePipelineAsyncStatus.InternalError, 0], 'the outcome');
+  },
+
   async 'a released handle does not come back as another object'(guest) {
     const { imports } = guest;
     const { instance, device } = await guest.device();
