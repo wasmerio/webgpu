@@ -473,6 +473,11 @@ impl ShimApi for Host {
             {
                 break;
             }
+            // A killed guest would otherwise wait here for as long as it
+            // asked to, and for ever if that is what it asked.
+            if cx.stopped() {
+                return Err(AbiError::Stopped);
+            }
             let remaining = match deadline {
                 Some(deadline) => deadline.saturating_duration_since(Instant::now()),
                 None => WAIT_SLICE,

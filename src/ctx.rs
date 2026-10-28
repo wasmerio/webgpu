@@ -326,9 +326,11 @@ impl WebGpuRuntimeHooks {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let host = crate::host::Host::for_memory(&self.ctx, store, &memory);
+            let kill_probe = memory.as_shared(store).map(|shared| shared.ops());
             let data = env.as_mut(store);
             data.memory = Some(memory);
             data.host = Some(host);
+            data.kill_probe = kill_probe;
         }
         #[cfg(all(target_arch = "wasm32", feature = "js"))]
         {

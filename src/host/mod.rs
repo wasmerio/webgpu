@@ -297,12 +297,28 @@ fn panic_message(panic: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_owned())
 }
 
+/// Whether the process whose memory this is was killed. WASIX disables the
+/// atomics of a killed process's memory to shake its threads out of their
+/// waits; a wait of no duration on an address nobody notifies tells whether
+/// that has happened, and nothing else.
+fn killed(probe: &wasmer::MemoryOps) -> bool {
+    matches!(
+        probe.wait(
+            wasmer::MemoryLocation::new_32(u32::MAX),
+            Some(std::time::Duration::ZERO)
+        ),
+        Err(wasmer::AtomicsError::AtomicsDisabled)
+    )
+}
+
 /// Runs one import: resolves the calling instance's memory and host, decodes
 /// through `f`, and turns failures into the right kind of guest-visible
 /// outcome.
 ///
 /// - A guest pointer outside linear memory traps, like the segfault it is,
 ///   whatever the implementation did with the failed copy.
+/// - A guest stopped while the call waited is stopped: the call traps, as
+///   soon as the call saw it, whatever the call returned.
 /// - Any other decoding error makes the call return its zero value.
 /// - A panic below (wgpu panics on a few misuse paths) traps this call
 ///   instead of unwinding through the wasm frames into the embedder.
@@ -317,18 +333,38 @@ pub(crate) fn enter<R: Default>(
             "{function}: WebGPU was called before the instance was set up"
         )));
     };
-    let mut cx = Cx {
-        mem: GuestMemory::new(memory.view(&store)),
-    };
+    // Only a kill stops a call. A context shut down by its embedder
+    // (`terminate_all`) leaves its guests running, with their devices lost.
+    let probe = data.kill_probe.clone();
+    let stopped = || probe.as_ref().is_some_and(killed);
+    let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
     let outcome = catch_unwind(AssertUnwindSafe(|| f(&host, &mut cx)));
+    finish(&host, function, &cx, outcome)
+}
+
+/// What a call that ran becomes for the guest; see [`enter`].
+fn finish<R: Default>(
+    host: &Host,
+    function: &'static str,
+    cx: &Cx<'_>,
+    outcome: std::thread::Result<AbiResult<R>>,
+) -> Result<R, RuntimeError> {
     // Checked before anything else: an implementation may have turned a
     // failed copy into a status of its own, and a wild pointer still traps.
     if let Some(fault) = cx.mem.take_fault() {
         return Err(RuntimeError::new(format!("{function}: {fault}")));
     }
+    // Likewise a call that found its guest stopped, even one that went on to
+    // return a status or nothing at all.
+    if cx.take_stop() {
+        return Err(RuntimeError::new(format!(
+            "{function}: {}",
+            AbiError::Stopped
+        )));
+    }
     match outcome {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error @ AbiError::OutOfBounds { .. })) => {
+        Ok(Err(error @ (AbiError::OutOfBounds { .. } | AbiError::Stopped))) => {
             Err(RuntimeError::new(format!("{function}: {error}")))
         }
         Ok(Err(error)) => {
@@ -342,6 +378,44 @@ pub(crate) fn enter<R: Default>(
                 "{function}: the WebGPU backend failed: {message}"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    fn with_cx(stopped: bool, f: impl FnOnce(&Host, &Cx<'_>)) {
+        let host = Host::new(Arc::clone(&crate::WebGpuCtx::default().inner));
+        let mut store = wasmer::Store::default();
+        let memory =
+            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false)).unwrap();
+        let stopped = move || stopped;
+        f(
+            &host,
+            &Cx::new(GuestMemory::new(memory.view(&store)), &stopped),
+        );
+    }
+
+    #[test]
+    fn a_call_that_saw_its_guest_stopped_traps_whatever_it_returned() {
+        with_cx(true, |host, cx| {
+            assert!(cx.stopped());
+            let error = finish(host, "wgpuTest", cx, Ok(Ok(7))).expect_err("traps");
+            assert!(error.to_string().contains("stopped"), "{error}");
+        });
+    }
+
+    #[test]
+    fn a_call_that_never_asked_returns_what_it_returned() {
+        // Only a check that sees the stop makes the call trap.
+        with_cx(true, |host, cx| {
+            assert_eq!(finish(host, "wgpuTest", cx, Ok(Ok(7))).unwrap(), 7);
+        });
+        with_cx(false, |host, cx| {
+            assert!(!cx.stopped());
+            assert_eq!(finish(host, "wgpuTest", cx, Ok(Ok(7))).unwrap(), 7);
+        });
     }
 }
 

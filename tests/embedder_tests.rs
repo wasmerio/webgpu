@@ -172,6 +172,42 @@ fn destroyed_and_released_storage_returns_to_the_budget() {
 }
 
 #[test]
+fn a_guest_killed_while_it_waits_lets_go() {
+    // The guest kills itself from a second thread while its first one waits
+    // on the GPU for something that never happens, without a system call.
+    let ctx = builder().build();
+    program("killed"); // build before the clock starts
+    let outcome = run_wasix_main_capture(&ctx, &program("killed"), &[], false);
+    match outcome {
+        Ok(output) => {
+            assert!(output.stdout.contains("killing"), "{}", output.stdout);
+            assert!(
+                !output.stdout.contains("the wait returned"),
+                "{}",
+                output.stdout
+            );
+            assert_ne!(output.exit_code, 0, "a killed program did not succeed");
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            assert!(error.contains("stopped"), "{error}");
+        }
+    }
+    // The run is over either way: a killed process is reported as ended
+    // whatever its threads are doing. What tells is whether the thread that
+    // was waiting came out of the host, and with it everything it held.
+    let ended = Instant::now();
+    while ctx.usage().processes != 0 {
+        assert!(
+            ended.elapsed() < Duration::from_secs(5),
+            "the killed guest still holds {:?}",
+            ctx.usage()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn terminate_all_gets_a_guest_out_of_a_wait_and_stays_in_effect() {
     let ctx = builder().build();
     let control = ctx.runtime_control();
