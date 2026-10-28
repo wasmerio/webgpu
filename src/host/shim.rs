@@ -475,7 +475,7 @@ impl ShimApi for Host {
             }
             // A killed guest would otherwise wait here for as long as it
             // asked to, and for ever if that is what it asked.
-            if (cx.stopped)() {
+            if cx.stopped() {
                 return Err(AbiError::Stopped);
             }
             let remaining = match deadline {

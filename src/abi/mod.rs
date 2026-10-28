@@ -181,10 +181,36 @@ mod native {
     /// Per-call context handed to every [`api`](super::api) method.
     pub struct Cx<'a> {
         pub mem: GuestMemory<'a>,
+        stopped: &'a dyn Fn() -> bool,
+        /// A [`Cx::stopped`] check found the guest stopped.
+        seen_stopped: std::cell::Cell<bool>,
+    }
+
+    impl<'a> Cx<'a> {
+        pub fn new(mem: GuestMemory<'a>, stopped: &'a dyn Fn() -> bool) -> Self {
+            Self {
+                mem,
+                stopped,
+                seen_stopped: std::cell::Cell::new(false),
+            }
+        }
+
         /// Whether the calling guest has been stopped meanwhile. A call that
-        /// waits asks between slices, and gives up with
-        /// [`AbiError::Stopped`].
-        pub stopped: &'a dyn Fn() -> bool,
+        /// waits asks between slices. Once this says so, the call traps when
+        /// it returns, whatever it returns: a stopped guest doesn't go on
+        /// with an answer made up for it.
+        pub fn stopped(&self) -> bool {
+            let stopped = (self.stopped)();
+            if stopped {
+                self.seen_stopped.set(true);
+            }
+            stopped
+        }
+
+        /// Whether a [`Cx::stopped`] check found the guest stopped, once.
+        pub fn take_stop(&self) -> bool {
+            self.seen_stopped.take()
+        }
     }
 
     /// Bounds-checked access to the calling instance's linear memory.
