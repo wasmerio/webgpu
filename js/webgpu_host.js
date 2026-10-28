@@ -3084,18 +3084,18 @@ export function createWebGpuHost({
      * - `origin`: where the image goes in the texture, `[x, y]` (default
      *   `[0, 0]`);
      * - `size`: the `[width, height]` copied (default: the whole image);
-     * - `flipY`, `premultipliedAlpha` and `colorSpace`, as the browser takes
-     *   them (defaults `false`, `true` and `'srgb'`).
+     * - `flipY`, `premultipliedAlpha` and `colorSpace`, with WebGPU's
+     *   defaults (`false`, `false` and `'srgb'`).
      *
      * The texture needs CopyDst and RenderAttachment usage. A failed copy is
      * the embedder's to hear, not the guest's: the copy runs under error
      * scopes of its own. Returns a promise of whether the copy was made; it is
-     * false, after logging, for a texture that is gone, a lost device, or a
-     * copy the browser refused.
+     * false, after logging, for a texture that is gone, a device lost or a
+     * host stopped before the copy completed, or a copy the browser refused.
      */
     copyExternalImage(handle, source, options = {}) {
       const {
-        origin = [0, 0], size = imageSize(source), flipY = false, premultipliedAlpha = true, colorSpace = 'srgb',
+        origin = [0, 0], size = imageSize(source), flipY = false, premultipliedAlpha = false, colorSpace = 'srgb',
       } = options;
       const fail = (message) => {
         log(`copyExternalImage: ${message}`);
@@ -3124,7 +3124,13 @@ export function createWebGpuHost({
       return Promise.all(popped).then(
         (errors) => {
           const error = thrown ?? errors.find((found) => found !== null);
-          return error ? fail(describe(error)) : true;
+          if (error) return fail(describe(error));
+          // A lost device reports no errors, and this host may learn of the
+          // loss only now: no error is not proof of a copy.
+          checkTerminated();
+          if (terminated) return fail('the host was stopped');
+          if (texture.device.lost) return fail('the texture\'s device is lost');
+          return true;
         },
         (error) => fail(describe(error)),
       );
