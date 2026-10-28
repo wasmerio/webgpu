@@ -68,7 +68,9 @@ impl Host {
     /// into events here. Returns whether any device still has work in flight.
     fn poll_devices(&self, wait: Option<Duration>) -> bool {
         let mut busy = false;
+        let now = Instant::now();
         for device in self.live_devices() {
+            device.uploads.trim(now);
             let poll = match wait {
                 Some(timeout) => wgpu::PollType::Wait {
                     submission_index: None,

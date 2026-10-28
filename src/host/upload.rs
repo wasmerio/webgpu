@@ -20,7 +20,8 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 use super::device::DeviceState;
 use super::lock;
@@ -36,6 +37,8 @@ const GRANULE: u64 = 1 << 20;
 const MAXIMUM_BUFFERS: usize = 8;
 /// Per guest, in bytes. Idle buffers are dropped to stay under it.
 pub(crate) const MAXIMUM_BYTES: u64 = 64 << 20;
+/// A buffer no upload took for this long is dropped (see [`Uploads::trim`]).
+const IDLE_LIFETIME: Duration = Duration::from_secs(2);
 
 thread_local! {
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -79,6 +82,8 @@ struct Staging {
     size: u64,
     /// Mapped and not in use.
     ready: Arc<AtomicBool>,
+    /// When an upload last took it.
+    taken_at: Instant,
 }
 
 impl Staging {
@@ -206,6 +211,26 @@ impl Uploads {
         true
     }
 
+    /// Drops the idle buffers no upload took for [`IDLE_LIFETIME`], so that a
+    /// guest that stopped uploading doesn't keep their memory. The host calls
+    /// this whenever it polls the device; a poll never waits for an upload
+    /// that holds the list, it just leaves trimming to the next one.
+    pub(crate) fn trim(&self, now: Instant) {
+        let mut buffers = match self.buffers.try_lock() {
+            Ok(buffers) => buffers,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        buffers.retain(|staging| {
+            let idle = staging.is_ready()
+                && now.saturating_duration_since(staging.taken_at) >= IDLE_LIFETIME;
+            if idle {
+                self.budget.release(staging.size);
+            }
+            !idle
+        });
+    }
+
     /// Drops every staging buffer: the device was destroyed or lost.
     pub(crate) fn clear(&self) {
         let mut buffers = lock(&self.buffers);
@@ -223,11 +248,12 @@ impl Uploads {
         }
         let mut buffers = lock(&self.buffers);
         let found = buffers
-            .iter()
+            .iter_mut()
             .filter(|staging| staging.size >= size && staging.is_ready())
             .min_by_key(|staging| staging.size);
         if let Some(staging) = found {
             staging.ready.store(false, Ordering::Release);
+            staging.taken_at = Instant::now();
             return Some(staging.clone());
         }
         let rounded = size.div_ceil(GRANULE) * GRANULE;
@@ -265,6 +291,7 @@ impl Uploads {
             buffer,
             size: rounded,
             ready: Arc::new(AtomicBool::new(false)),
+            taken_at: Instant::now(),
         };
         buffers.push(staging.clone());
         Some(staging)
@@ -801,6 +828,30 @@ mod native_gpu_tests {
 
     #[test]
     #[ignore = "requires a native GPU"]
+    fn idle_buffers_are_dropped_and_busy_ones_kept() {
+        let (host, device) = device(None);
+        let texture = texture(&device);
+        with_memory(|memory| {
+            assert!(upload(&device, memory, &texture));
+            let later = Instant::now() + IDLE_LIFETIME;
+            // In flight: kept, however long ago it was taken.
+            device.uploads.trim(later);
+            assert_eq!(device.uploads.buffer_sizes(), [GRANULE]);
+            device
+                .device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            // Idle, but taken recently: kept.
+            device.uploads.trim(Instant::now());
+            assert_eq!(device.uploads.buffer_sizes(), [GRANULE]);
+            device.uploads.trim(later);
+            assert!(device.uploads.buffer_sizes().is_empty());
+        });
+        assert_eq!(host.staging.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU"]
     fn a_small_gpu_budget_leaves_uploads_to_write_texture() {
         let (host, device) = device(Some(GRANULE / 2));
         let texture = texture(&device);
@@ -852,5 +903,189 @@ mod native_gpu_tests {
         });
         assert!(device.uploads.buffer_sizes().is_empty());
         assert_eq!(host.staging.used.load(Ordering::Acquire), 0);
+    }
+}
+
+/// What staging costs and saves, on the GPU to measure:
+/// `WEBGPU_MEASURE=1 cargo test --release --features cli --lib upload::measure
+/// -- --ignored --nocapture` (`WGPU_BACKEND=vulkan` on Linux for Vulkan).
+/// Without `WEBGPU_MEASURE` it does nothing, so that running every ignored
+/// test (the GPU tests) doesn't run it.
+#[cfg(test)]
+mod measure {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::WebGpuCtx;
+    use crate::host::Host;
+
+    struct Plane {
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        texel: u32,
+    }
+
+    const FRAMES: usize = 240;
+
+    fn device() -> (Host, Arc<DeviceState>, wgpu::Backend) {
+        let host = Host::new(Arc::clone(&WebGpuCtx::default().inner));
+        let native = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            pollster::block_on(native.request_adapter(&Default::default())).expect("a GPU adapter");
+        let backend = adapter.get_info().backend;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("a device");
+        let state = DeviceState::new(&host, device, queue, adapter.get_info(), 0);
+        (host, state, backend)
+    }
+
+    /// Per-frame CPU time of the writes, at the median and 95th percentile,
+    /// the whole run's time once the GPU caught up, and how many writes were
+    /// staged.
+    fn run(
+        device: &Arc<DeviceState>,
+        memory: &GuestMemory<'_>,
+        planes: &[Plane],
+        staged: bool,
+    ) -> (Duration, Duration, Duration, usize) {
+        let textures: Vec<_> = planes
+            .iter()
+            .map(|plane| {
+                device.device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: plane.width,
+                        height: plane.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: plane.format,
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            })
+            .collect();
+        let mut times = Vec::with_capacity(FRAMES);
+        let mut count = 0;
+        let started = Instant::now();
+        for _ in 0..FRAMES {
+            let frame = Instant::now();
+            for (plane, texture) in planes.iter().zip(&textures) {
+                let destination = wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                };
+                let stride = plane.width * plane.texel;
+                let data_size = stride * plane.height;
+                let layout = wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: None,
+                };
+                let size = wgpu::Extent3d {
+                    width: plane.width,
+                    height: plane.height,
+                    depth_or_array_layers: 1,
+                };
+                if staged
+                    && device.uploads.write_texture(
+                        device,
+                        memory,
+                        destination,
+                        0,
+                        data_size,
+                        layout,
+                        size,
+                    )
+                {
+                    count += 1;
+                } else {
+                    // What wgpuQueueWriteTexture does without staging.
+                    let bytes = memory.read_vec(0, u64::from(data_size)).unwrap();
+                    device
+                        .queue
+                        .write_texture(destination, &bytes, layout, size);
+                }
+            }
+            times.push(frame.elapsed());
+            // The guest's own frame: one submission, and a poll as its loop would.
+            device.queue.submit([]);
+            device.device.poll(wgpu::PollType::Poll).unwrap();
+        }
+        device
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let total = started.elapsed();
+        times.sort();
+        (times[FRAMES / 2], times[FRAMES * 95 / 100], total, count)
+    }
+
+    #[test]
+    #[ignore = "measures; needs a GPU and --release to mean anything"]
+    fn measure() {
+        if std::env::var_os("WEBGPU_MEASURE").is_none() {
+            return;
+        }
+        let (_host, device, backend) = device();
+        let mut store = wasmer::Store::default();
+        let memory =
+            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(512, None, false)).unwrap();
+        let memory = GuestMemory::new(memory.view(&store));
+        let rgba = |width, height| Plane {
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            width,
+            height,
+            texel: 4,
+        };
+        let workloads: [(&str, Vec<Plane>); 4] = [
+            ("RGBA 1280x720", vec![rgba(1280, 720)]),
+            ("RGBA 1920x1080", vec![rgba(1920, 1080)]),
+            (
+                "NV12 1920x1080 (Y + UV planes)",
+                vec![
+                    Plane {
+                        format: wgpu::TextureFormat::R8Unorm,
+                        width: 1920,
+                        height: 1080,
+                        texel: 1,
+                    },
+                    Plane {
+                        format: wgpu::TextureFormat::Rg8Unorm,
+                        width: 960,
+                        height: 540,
+                        texel: 2,
+                    },
+                ],
+            ),
+            ("RGBA 512x256 (just over 256 KiB)", vec![rgba(512, 256)]),
+        ];
+        println!("backend: {backend:?}, {FRAMES} frames each");
+        println!(
+            "| Workload | Path | Writes, median | Writes, p95 | Whole run | Staged writes | Extra submissions |"
+        );
+        println!("|---|---|---|---|---|---|---|");
+        for (name, planes) in &workloads {
+            for staged in [false, true] {
+                // A warm-up run, then the measured one.
+                run(&device, &memory, planes, staged);
+                let (median, p95, total, count) = run(&device, &memory, planes, staged);
+                println!(
+                    "| {name} | {} | {:.2} ms | {:.2} ms | {:.0} ms | {count} of {} | {count} |",
+                    if staged { "staged" } else { "write_texture" },
+                    median.as_secs_f64() * 1e3,
+                    p95.as_secs_f64() * 1e3,
+                    total.as_secs_f64() * 1e3,
+                    planes.len() * FRAMES,
+                );
+            }
+        }
+        println!("staging buffers held: {:?}", device.uploads.buffer_sizes());
     }
 }
