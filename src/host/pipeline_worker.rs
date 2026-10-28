@@ -32,7 +32,7 @@ impl ThreadSlot {
     }
     fn from_counter(counter: &'static AtomicUsize) -> Option<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_COMPILER_THREADS).then_some(count + 1)
             })
             .ok()
