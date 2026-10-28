@@ -28,8 +28,6 @@ use crate::abi::GuestMemory;
 
 /// Uploads of at least this many bytes of texels use the staging buffers.
 const MINIMUM_BYTES: u64 = 256 * 1024;
-/// The largest texel of an uncompressed color format.
-const MAXIMUM_TEXEL_BYTES: u64 = 16;
 const ALIGNMENT: u64 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
 /// Staging buffer sizes are rounded up to this, so that uploads of nearby
 /// sizes share buffers.
@@ -128,10 +126,6 @@ impl Uploads {
         layout: wgpu::TexelCopyBufferLayout,
         size: wgpu::Extent3d,
     ) -> bool {
-        // Too few texels, whatever their format.
-        if u64::from(size.width) * u64::from(size.height) * MAXIMUM_TEXEL_BYTES < MINIMUM_BYTES {
-            return false;
-        }
         let Some(rows) = Rows::of(
             &Destination::of(&destination),
             memory.size(),
@@ -608,6 +602,11 @@ mod tests {
             ..valid
         };
         let memory = MEMORY as u32;
+        let huge = wgpu::Extent3d {
+            width: u32::MAX,
+            height: u32::MAX,
+            depth_or_array_layers: 1,
+        };
         let cases = [
             ("two images", 0, whole, valid, two_layers),
             ("no stride", 0, whole, no_stride, SIZE),
@@ -640,6 +639,7 @@ mod tests {
                 layout(u64::MAX - 8, WIDTH * 4),
                 SIZE,
             ),
+            ("the largest extent there is", 0, whole, valid, huge),
         ];
         for (what, data, data_size, layout, size) in cases {
             assert!(
@@ -764,6 +764,39 @@ mod native_gpu_tests {
         assert_eq!(host.staging.used.load(Ordering::Acquire), 2 * GRANULE);
         drop(device);
         assert_eq!(host.staging.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU"]
+    fn the_largest_extent_is_left_to_write_texture() {
+        let (_host, device) = device(None);
+        let texture = texture(&device);
+        with_memory(|memory| {
+            let staged = device.uploads.write_texture(
+                &device,
+                memory,
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                0,
+                WIDTH * HEIGHT * 4,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(u32::MAX),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: u32::MAX,
+                    height: u32::MAX,
+                    depth_or_array_layers: 1,
+                },
+            );
+            assert!(!staged);
+        });
+        assert!(device.uploads.buffer_sizes().is_empty());
     }
 
     #[test]
