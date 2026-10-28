@@ -81,6 +81,8 @@ extern "C" {
 /// The JavaScript host of one guest instance, with the callbacks it was given.
 pub(crate) struct JsHost {
     host: JsValue,
+    /// The context's canvas scope, which the embedder is told with the host.
+    scope: u32,
     _get_canvas: Closure<dyn Fn(JsValue) -> JsValue>,
     _is_terminated: Closure<dyn Fn() -> bool>,
     _event_waker: Option<Closure<dyn Fn()>>,
@@ -283,6 +285,7 @@ pub(crate) fn add_imports(
     // The host calls these for as long as it lives; it owns them from here.
     let host = JsHost {
         host,
+        scope,
         _get_canvas: get_canvas,
         _is_terminated: is_terminated,
         _event_waker: event_waker,
@@ -324,16 +327,14 @@ pub(crate) fn add_imports(
         exports.insert(sig.name, function);
     }
     imports.register_namespace(abi::IMPORT_MODULE, exports);
-    // Once the imports are in place: a host the embedder hears of is one the
-    // guest uses. It is disposed of with the instance, after which
-    // `copyExternalImage` answers false.
-    host_created(&host.host, scope)
-        .map_err(|error| js_error("the embedder's __wasmerWebGpuHostCreated", &error))?;
     env.as_mut(store).js_host = Some(host);
     Ok(())
 }
 
-/// Tells the instance's JavaScript host which memory its pointers refer to.
+/// Tells the instance's JavaScript host which memory its pointers refer to,
+/// then tells the embedder about the host: only a host whose instance exists
+/// is announced. It is disposed of with the instance, after which
+/// `copyExternalImage` answers false.
 pub(crate) fn configure_instance(
     store: &mut StoreMut<'_>,
     env: &FunctionEnv<WebGpuEnv>,
@@ -352,5 +353,7 @@ pub(crate) fn configure_instance(
     set_memory
         .call1(&host.host, &memory)
         .map_err(|error| js_error("binding guest memory to the JavaScript WebGPU host", &error))?;
+    host_created(&host.host, host.scope)
+        .map_err(|error| js_error("the embedder's __wasmerWebGpuHostCreated", &error))?;
     Ok(())
 }

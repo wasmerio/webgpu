@@ -269,11 +269,12 @@ What a browser changes, and cannot hide:
 
 Two things reach an embedder with work of its own in the guest's worker. The
 waker of `WebGpuCtxBuilder::event_waker` becomes the host's `eventWaker`: it
-runs when an event becomes ready, so a guest that waits for something else
-(window input) can be woken for it. And if the worker has a
+runs when an event becomes ready (as a promise settles, or during the guest
+call that made it ready), so a guest that waits for something else (window
+input) can be woken for it. And if the worker has a
 `globalThis.__wasmerWebGpuHostCreated(host, scope)`, it is called with each
-instance's host, whose `copyExternalImage` copies an image the embedder holds
-into one of the guest's textures.
+instance's host once the instance exists; the host's `copyExternalImage`
+copies an image the embedder holds into one of the guest's textures.
 
 One thing the host does only because of a browser bug. Chrome answers every
 submit from its GPU process and keeps the queue alive by itself until then.

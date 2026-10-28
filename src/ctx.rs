@@ -99,10 +99,12 @@ impl WebGpuCtxBuilder {
     /// thread inside WebGPU might hold: a lock such a thread takes, or a
     /// bounded channel it drains. Hold only weak references to what it wakes.
     ///
-    /// In a browser it runs in the guest's own worker, when a promise of the
-    /// JavaScript host settles (`eventWaker` of `js/webgpu_host.js`). That
-    /// happens only while the worker is free: a guest that blocks its worker
-    /// while it waits is not woken by it.
+    /// In a browser it is the JavaScript host's `eventWaker`, and runs in the
+    /// guest's own worker: mostly when one of the host's promises settles,
+    /// which happens only while the worker is free (a guest that blocks its
+    /// worker while it waits is not woken by it), but also during one of the
+    /// guest's own WebGPU calls, for an event that call made ready. It must
+    /// only signal there too.
     pub fn event_waker(mut self, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.event_waker = Some(wake);
         self
