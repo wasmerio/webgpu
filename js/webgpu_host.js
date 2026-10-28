@@ -168,6 +168,12 @@ const toU32 = (value) => value >>> 0;
 const toU64 = (value) => BigInt.asUintN(64, value);
 const unchanged = (value) => value;
 
+/** The size of an image as `copyExternalImageToTexture` copies it. */
+const imageSize = (source) => [
+  source.displayWidth ?? source.videoWidth ?? source.naturalWidth ?? source.width,
+  source.displayHeight ?? source.videoHeight ?? source.naturalHeight ?? source.height,
+];
+
 // ---------------------------------------------------------------------------
 // Queues the browser still owes an answer
 // ---------------------------------------------------------------------------
@@ -536,8 +542,9 @@ const registeredCanvas = (selector) => globalThis.__wasmerWebGpuCanvases?.get(se
  * - `limits`: `{ maxObjects, maxDevices, maxPendingEvents, maxGpuMemoryBytes }`,
  *   the ceilings of `WebGpuLimits` on the native host.
  *
- * Returns `{ imports, setMemory, dispose }`. `imports` has one function per
- * entry of `IMPORTS`; the suspending ones are `async` when `suspending`.
+ * Returns `{ imports, setMemory, copyExternalImage, dispose }`. `imports` has
+ * one function per entry of `IMPORTS`; the suspending ones are `async` when
+ * `suspending`.
  */
 export function createWebGpuHost({
   gpu = globalThis.navigator?.gpu,
@@ -3152,6 +3159,66 @@ export function createWebGpuHost({
     /** The guest's `WebAssembly.Memory`. Call it before the guest runs. */
     setMemory(memory) {
       mem.set(memory);
+    },
+    /**
+     * Copies an image the embedder holds into the guest's texture `handle`,
+     * on the GPU, with `GPUQueue.copyExternalImageToTexture`: how an embedder
+     * hands its guest a frame it decoded, captured or drew itself. `source` is
+     * any `GPUCopyExternalImageSource` (an `ImageBitmap`, a canvas, a
+     * `VideoFrame`...). Options:
+     * - `origin`: where the image goes in the texture, `[x, y]` (default
+     *   `[0, 0]`);
+     * - `size`: the `[width, height]` copied (default: the whole image);
+     * - `flipY`, `premultipliedAlpha` and `colorSpace`, with WebGPU's
+     *   defaults (`false`, `false` and `'srgb'`).
+     *
+     * The texture needs CopyDst and RenderAttachment usage. A failed copy is
+     * the embedder's to hear, not the guest's: the copy runs under error
+     * scopes of its own. Returns a promise of whether the copy was made; it is
+     * false, after logging, for a texture that is gone, a device lost or a
+     * host stopped before the copy completed, or a copy the browser refused.
+     */
+    copyExternalImage(handle, source, options = {}) {
+      const {
+        origin = [0, 0], size = imageSize(source), flipY = false, premultipliedAlpha = false, colorSpace = 'srgb',
+      } = options;
+      const fail = (message) => {
+        log(`copyExternalImage: ${message}`);
+        return false;
+      };
+      checkTerminated();
+      if (terminated) return Promise.resolve(fail('the host was stopped'));
+      const texture = table.peek(handle, 'Texture');
+      if (texture === null) return Promise.resolve(fail(`${hex(handle)} is not a live texture`));
+      if (texture.device.lost) return Promise.resolve(fail('the texture\'s device is lost'));
+      const gpu = texture.device.object;
+      // Pushed and popped before the guest runs again, so its own scopes
+      // never see them.
+      const filters = ['validation', 'out-of-memory', 'internal'];
+      for (const filter of filters) gpu.pushErrorScope(filter);
+      let thrown = null;
+      try {
+        gpu.queue.copyExternalImageToTexture(
+          { source, flipY }, { texture: texture.object, origin, premultipliedAlpha, colorSpace }, size,
+        );
+      } catch (error) {
+        // An image that is closed, detached or not same-origin.
+        thrown = error;
+      }
+      const popped = filters.map(() => gpu.popErrorScope());
+      return Promise.all(popped).then(
+        (errors) => {
+          const error = thrown ?? errors.find((found) => found !== null);
+          if (error) return fail(describe(error));
+          // A lost device reports no errors, and this host may learn of the
+          // loss only now: no error is not proof of a copy.
+          checkTerminated();
+          if (terminated) return fail('the host was stopped');
+          if (texture.device.lost) return fail('the texture\'s device is lost');
+          return true;
+        },
+        (error) => fail(describe(error)),
+      );
     },
     /**
      * Ends the host: stops the guest's GPU work (see `isTerminated`),

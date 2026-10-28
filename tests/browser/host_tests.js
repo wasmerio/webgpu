@@ -32,8 +32,10 @@ function spyOn(gpu) {
         const member = target[key];
         if (typeof member !== 'function') return wrap(member);
         return (...args) => {
-          calls.push({ method: key, args });
-          return wrap(member.apply(target, unwrap(args)));
+          const call = { method: key, args };
+          calls.push(call);
+          call.result = wrap(member.apply(target, unwrap(args)));
+          return call.result;
         };
       },
       set(target, key, member) {
@@ -56,6 +58,8 @@ function spyOn(gpu) {
     gpu: wrap(gpu),
     /** The arguments of the last call of `method`. */
     last: (method) => calls.findLast((call) => call.method === method)?.args,
+    /** What the last call of `method` returned. */
+    lastResult: (method) => calls.findLast((call) => call.method === method)?.result,
     count: (method) => calls.filter((call) => call.method === method).length,
   };
 }
@@ -176,6 +180,34 @@ function check(condition, message) {
 function equal(actual, expected, what) {
   const show = (value) => JSON.stringify(value, (_, member) => (typeof member === 'bigint' ? `${member}n` : member));
   check(show(actual) === show(expected), `${what}: got ${show(actual)}, expected ${show(expected)}`);
+}
+
+/** A 4x4 RGBA8 guest texture an image can be copied into, and its browser object. */
+function imageTarget(guest, device) {
+  const T = S.WGPUTextureDescriptor;
+  const descriptor = guest.alloc(T.__size);
+  const usage = F.TextureUsage.CopyDst | F.TextureUsage.CopySrc | F.TextureUsage.RenderAttachment;
+  guest.view.setBigUint64(descriptor + T.usage, BigInt(usage), true);
+  guest.view.setUint32(descriptor + T.size + S.WGPUExtent3D.width, 4, true);
+  guest.view.setUint32(descriptor + T.size + S.WGPUExtent3D.height, 4, true);
+  guest.view.setUint32(descriptor + T.size + S.WGPUExtent3D.depthOrArrayLayers, 1, true);
+  guest.view.setUint32(descriptor + T.format, E.TextureFormat.RGBA8Unorm, true);
+  guest.view.setUint32(descriptor + T.mipLevelCount, 1, true);
+  guest.view.setUint32(descriptor + T.sampleCount, 1, true);
+  const texture = guest.imports.wgpuDeviceCreateTexture(device, descriptor);
+  return { texture, gpuTexture: guest.spy.lastResult('createTexture') };
+}
+
+/** The texels of a 4x4 RGBA8 texture, rows 256 bytes apart. */
+async function readTexels(gpuDevice, gpuTexture) {
+  const readback = gpuDevice.createBuffer({ size: 256 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const encoder = gpuDevice.createCommandEncoder();
+  encoder.copyTextureToBuffer({ texture: gpuTexture }, { buffer: readback, bytesPerRow: 256 }, [4, 4]);
+  gpuDevice.queue.submit([encoder.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const texels = new Uint8Array(readback.getMappedRange()).slice();
+  readback.unmap();
+  return texels;
 }
 
 const TESTS = {
@@ -386,6 +418,80 @@ const TESTS = {
     const [uncaptured] = guest.records();
     equal([uncaptured.kind, uncaptured.handle, uncaptured.aux, uncaptured.future],
       [EVENT.UncapturedError, device, E.ErrorType.Validation, 0n], 'the uncaptured error');
+  },
+
+  async 'an embedder copies an image into a guest texture, and alone hears what fails'(guest) {
+    const { imports } = guest;
+    const { device } = await guest.device();
+    const gpuDevice = await guest.spy.lastResult('requestDevice');
+    const { texture, gpuTexture } = imageTarget(guest, device);
+    // Opaque texels (x * 60, y * 60, 200).
+    const pixels = new Uint8ClampedArray(4 * 4 * 4);
+    for (let i = 0; i < 16; i++) pixels.set([(i % 4) * 60, Math.floor(i / 4) * 60, 200, 255], i * 4);
+    const image = await createImageBitmap(new ImageData(pixels, 4, 4));
+
+    // The top-left 2x2 of the image, at (2, 1).
+    equal(await guest.host.copyExternalImage(texture, image, { origin: [2, 1], size: [2, 2] }), true, 'a copy');
+    const texels = await readTexels(gpuDevice, gpuTexture);
+    for (let y = 0; y < 4; y++) {
+      for (let x = 0; x < 4; x++) {
+        const inside = x >= 2 && x < 4 && y >= 1 && y < 3;
+        const expected = inside ? [(x - 2) * 60, (y - 1) * 60, 200, 255] : [0, 0, 0, 0];
+        equal([...texels.subarray(y * 256 + x * 4, y * 256 + x * 4 + 4)], expected, `texel (${x}, ${y})`);
+      }
+    }
+
+    // Failures reach the embedder's log, never the guest's scopes or callback.
+    const pop = () => guest.complete((future) => imports.wasmer_wgpu_device_pop_error_scope(device, future));
+    imports.wgpuDevicePushErrorScope(device, E.ErrorFilter.Validation);
+    const noCopyDst = guest.renderTarget(device).texture;
+    equal(await guest.host.copyExternalImage(noCopyDst, image), false, 'a copy into a texture without CopyDst');
+    check(guest.log.at(-1).startsWith('copyExternalImage: '), `not logged: ${guest.log.at(-1)}`);
+    equal((await pop()).aux, E.ErrorType.NoError, 'the guest\'s scope');
+    equal(await guest.host.copyExternalImage(device, image), false, 'a copy into a device handle');
+    check(guest.log.at(-1).includes('is not a live texture'), `not logged: ${guest.log.at(-1)}`);
+    image.close();
+    equal(await guest.host.copyExternalImage(texture, image), false, 'a copy of a closed image');
+    equal(guest.records().filter((record) => record.kind === EVENT.UncapturedError), [], 'uncaptured errors');
+    guest.host.dispose();
+    equal(await guest.host.copyExternalImage(texture, image), false, 'a copy after dispose');
+    check(guest.log.at(-1).includes('the host was stopped'), `not logged: ${guest.log.at(-1)}`);
+  },
+
+  async 'a copied image keeps straight alpha unless premultiplied alpha is asked for'(guest) {
+    const { device } = await guest.device();
+    const gpuDevice = await guest.spy.lastResult('requestDevice');
+    const { texture, gpuTexture } = imageTarget(guest, device);
+    const image = await createImageBitmap(new ImageData(new Uint8ClampedArray([200, 100, 50, 128]), 1, 1),
+      { premultiplyAlpha: 'none' });
+    const near = (actual, expected, what) => check(actual.every((value, i) => Math.abs(value - expected[i]) <= 2),
+      `${what}: got ${[...actual]}, expected ${expected}`);
+    // WebGPU's default: the texel is what the image holds.
+    equal(await guest.host.copyExternalImage(texture, image), true, 'a copy with the default');
+    near((await readTexels(gpuDevice, gpuTexture)).subarray(0, 4), [200, 100, 50, 128], 'straight alpha');
+    equal(await guest.host.copyExternalImage(texture, image, { premultipliedAlpha: true }), true, 'a premultiplied copy');
+    near((await readTexels(gpuDevice, gpuTexture)).subarray(0, 4), [100, 50, 25, 128], 'premultiplied alpha');
+  },
+
+  async 'a copy is not reported as made once its device or host is gone'(guest) {
+    const image = await createImageBitmap(new ImageData(4, 4));
+    // The browser destroys the device under the host, which hears of it later.
+    const { device } = await guest.device();
+    const { texture } = imageTarget(guest, device);
+    (await guest.spy.lastResult('requestDevice')).destroy();
+    equal(await guest.host.copyExternalImage(texture, image), false, 'a copy onto a destroyed device');
+    check(guest.log.at(-1).includes('device is lost'), `not logged: ${guest.log.at(-1)}`);
+    // The host is disposed while the copy is under way.
+    const other = new Guest();
+    try {
+      const target = imageTarget(other, (await other.device()).device).texture;
+      const copied = other.host.copyExternalImage(target, image);
+      other.host.dispose();
+      equal(await copied, false, 'a copy whose host was disposed meanwhile');
+      check(other.log.at(-1).includes('the host was stopped'), `not logged: ${other.log.at(-1)}`);
+    } finally {
+      other.host.dispose();
+    }
   },
 
   async 'the embedder hears of each event, and a waker that throws loses none'() {
