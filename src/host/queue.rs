@@ -97,6 +97,27 @@ impl QueueApi for Host {
         else {
             return;
         };
+        let destination = wgpu::TexelCopyTextureInfo {
+            texture: &texture.texture,
+            mip_level: destination.mip_level,
+            origin: convert::origin3d(&destination.origin),
+            aspect: convert::texture_aspect(destination.aspect),
+        };
+        let layout = convert::texel_copy_buffer_layout(data_layout);
+        let size = convert::extent3d(write_size);
+        if Arc::ptr_eq(&texture.device, &device)
+            && device.uploads.write_texture(
+                &device,
+                &cx.mem,
+                destination,
+                data,
+                data_size,
+                layout,
+                size,
+            )
+        {
+            return;
+        }
         let Ok(bytes) = cx.mem.read_vec(data, u64::from(data_size)) else {
             self.validation(
                 &device,
@@ -104,17 +125,9 @@ impl QueueApi for Host {
             );
             return;
         };
-        device.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture.texture,
-                mip_level: destination.mip_level,
-                origin: convert::origin3d(&destination.origin),
-                aspect: convert::texture_aspect(destination.aspect),
-            },
-            &bytes,
-            convert::texel_copy_buffer_layout(data_layout),
-            convert::extent3d(write_size),
-        );
+        device
+            .queue
+            .write_texture(destination, &bytes, layout, size);
     }
 
     fn queue_set_label(&self, _cx: &mut Cx<'_>, queue: Handle, _label: &str) {

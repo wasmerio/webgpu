@@ -23,7 +23,9 @@ pub struct WebGpuLimits {
     /// Completed events the guest has not collected yet. Beyond it, further
     /// uncaptured errors are dropped (and counted) rather than queued.
     pub max_pending_events: Option<usize>,
-    /// Bytes of buffer and texture storage the guest may have allocated.
+    /// Bytes of buffer and texture storage the guest may have allocated. The
+    /// staging buffers the host keeps for large texture uploads don't count:
+    /// they hold at most 64 MiB per guest, and no more than this.
     pub max_gpu_memory_bytes: Option<u64>,
 }
 

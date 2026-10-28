@@ -64,6 +64,8 @@ pub(crate) struct DeviceState {
     /// The guest's queue handle while it holds one, so `wgpuDeviceGetQueue`
     /// keeps returning the same value.
     queue_handle: Mutex<Handle>,
+    /// Staging buffers for large texture uploads.
+    pub(crate) uploads: super::upload::Uploads,
 }
 
 impl DeviceState {
@@ -110,6 +112,7 @@ impl DeviceState {
             link,
             adapter_info,
             queue_handle: Mutex::new(0),
+            uploads: super::upload::Uploads::new(Arc::clone(&host.staging)),
         })
     }
 
@@ -123,6 +126,7 @@ impl DeviceState {
 
     /// Destroys the device. The lost callback fires through wgpu.
     pub(crate) fn destroy(&self) {
+        self.uploads.clear();
         self.device.destroy();
         // wgpu reports the loss on its next poll; make it immediate so a
         // guest waiting on the lost future does not depend on anything else
