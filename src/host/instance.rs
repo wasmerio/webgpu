@@ -1,6 +1,7 @@
 //! `WGPUInstance` and the global functions.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::{Host, Object, ObjectKind};
 use crate::abi::api::{GlobalApi, InstanceApi};
@@ -13,6 +14,7 @@ pub(crate) const TIMED_WAIT_ANY_MAX_COUNT: u32 = 64;
 
 pub(crate) struct InstanceState {
     pub(crate) instance: wgpu::Instance,
+    pub(crate) active: AtomicBool,
 }
 
 /// The WGSL language features of this backend, as C enum values.
@@ -79,7 +81,13 @@ impl GlobalApi for Host {
         // an embedder's debugging aid, never something a guest pays for.
         options.flags = wgpu::InstanceFlags::empty().with_env();
         let instance = wgpu::Instance::new(options);
-        self.insert(Object::Instance(Arc::new(InstanceState { instance })), 0)
+        self.insert(
+            Object::Instance(Arc::new(InstanceState {
+                instance,
+                active: AtomicBool::new(true),
+            })),
+            0,
+        )
     }
 
     fn get_instance_limits(&self, cx: &mut Cx<'_>, limits: OutPtr<InstanceLimits>) -> Status {

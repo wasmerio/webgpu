@@ -42,6 +42,11 @@
       "stdout": "valid shader: no errors\ninvalid shader: validation error with located messages\nasync compute pipeline: 7 * scale = 21\nindirect dispatch: 21 * scale = 63\nasync render pipeline: created\nasync pipeline failure: reported through the callback\nspir-v: handled as the instance features say\nok\n"
     },
     {
+      "name": "pipelines_async_owned",
+      "browser": false,
+      "stdout": "owned compute: WaitAnyOnly owner, released inputs, 7 * 3 = 21\nowned render: WaitAnyOnly owner, released inputs, 16 red pixels\nok\n"
+    },
+    {
       "name": "surface",
       "stdout": "capabilities: ok\nunconfigured: no current texture\npresented 3 frames\nunconfigured again: no current texture\nsurface made again for the same target\nok\n"
     },

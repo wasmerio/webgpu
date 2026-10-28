@@ -425,7 +425,7 @@ function encodeRecord({ future = 0n, kind, status = 0, handle = 0, aux = 0, mess
  * Completed asynchronous work, waiting for the guest to collect it
  * (src/host/events.rs).
  */
-function eventQueue(maxPending) {
+function eventQueue(maxPending, wakeOwner) {
   const ready = [];
   const waiters = new Set();
   let epoch = 0n;
@@ -441,12 +441,24 @@ function eventQueue(maxPending) {
      * (uncaptured errors) are dropped once the queue is over its limit, so a
      * guest that never polls cannot grow host memory without bound.
      */
-    push(record) {
+    push(record, retire = null, tag = null) {
       const future = record.future ?? 0n;
       if (future === 0n && ready.length >= maxPending) return;
-      ready.push({ future, bytes: encodeRecord(record) });
+      ready.push({ future, bytes: encodeRecord(record), retire, tag });
+      // Commit queue ownership before notifying any waiter (which may throw).
+      if (tag !== null) tag.queued = true;
       epoch += 1n;
+      wakeOwner();
       for (const wake of [...waiters]) wake();
+    },
+    /** Retires only tagged pipeline events whose instance/host is gone. */
+    discardTagged(predicate) {
+      for (let i = ready.length - 1; i >= 0; --i) {
+        if (ready[i].tag !== null && predicate(ready[i].tag)) {
+          const [record] = ready.splice(i, 1);
+          record.retire?.(true);
+        }
+      }
     },
     isReady(futures) {
       return ready.some((record) => record.future !== 0n && futures.includes(record.future));
@@ -480,7 +492,8 @@ function eventQueue(maxPending) {
         written += bytes.length;
         taken += 1;
       }
-      ready.splice(0, taken);
+      const consumed = ready.splice(0, taken);
+      for (const record of consumed) record.retire?.(false);
       return written;
     },
   };
@@ -516,6 +529,10 @@ const registeredCanvas = (selector) => globalThis.__wasmerWebGpuCanvases?.get(se
  * - `isTerminated()`: the embedder's kill switch. Once it returns true the
  *   guest's GPU work is stopped, as by `dispose`, but the imports keep
  *   answering the calls a dying guest still makes.
+ * - `eventWaker()`: called whenever an event becomes ready for the guest, so
+ *   that an embedder whose own loop waits on something else can wake it, as
+ *   `WebGpuCtxBuilder::event_waker` does natively. The guest still collects
+ *   the event by polling. It must only signal, not call into the guest.
  * - `limits`: `{ maxObjects, maxDevices, maxPendingEvents, maxGpuMemoryBytes }`,
  *   the ceilings of `WebGpuLimits` on the native host.
  *
@@ -529,6 +546,7 @@ export function createWebGpuHost({
   suspending = typeof WebAssembly.Suspending === 'function',
   forceFallbackAdapter = false,
   isTerminated = () => false,
+  eventWaker = null,
   limits: {
     maxObjects = Infinity,
     maxDevices = Infinity,
@@ -538,7 +556,24 @@ export function createWebGpuHost({
 } = {}) {
   const mem = guestMemory();
   const table = handleTable(maxObjects, log);
-  const events = eventQueue(maxPendingEvents);
+  const events = eventQueue(maxPendingEvents, () => {
+    // A waker that throws must not strand the event: it stays queued.
+    try {
+      eventWaker?.();
+    } catch (error) {
+      log(`eventWaker: ${describe(error)}`);
+    }
+  });
+  const pipelineJobs = new Set();
+  const discardPipelines = (predicate) => {
+    for (const job of pipelineJobs) {
+      if (!predicate(job)) continue;
+      job.discarded = true;
+      // Browser compilation is not cancellable. Pending jobs retain admission
+      // until their Promise settles; no late handle/event may be published.
+    }
+    events.discardTagged(predicate);
+  };
   /** Devices that are not lost, for termination and the device limit. */
   const devices = new Set();
   /** Surfaces whose target has not been released yet. */
@@ -1752,29 +1787,74 @@ export function createWebGpuHost({
 
   // -- the imports ------------------------------------------------------------
 
-  /** Starts `wgpuDeviceCreate{Compute,Render}PipelineAsync`. */
+  /**
+   * Starts `wgpuDevice{Compute,Render}PipelineAsync` with the browser's own
+   * asynchronous compilation. A result whose instance was released, or whose
+   * device was lost or host disposed meanwhile, is never published.
+   */
   const createPipelineAsync = (event, kind, method, describeDescriptor) => (deviceHandle, descriptorPtr, future) => {
     const PipelineStatus = E.CreatePipelineAsyncStatus;
-    // A failure is the callback's to report: it raises no device error.
-    settle(future, event, PipelineStatus.ValidationError, () => {
+    const failure = (status, message) => ({ status, message });
+    const job = { done: false, queued: false, discarded: false, instance: null, handle: 0 };
+    pipelineJobs.add(job);
+    const complete = (record) => {
+      if (job.done) return;
+      job.done = true;
+      if (job.discarded || disposed) { pipelineJobs.delete(job); return; }
+      try {
+        events.push({ ...record, future, kind: event }, (discarded) => {
+          if (discarded && job.handle) table.release(job.handle, kind);
+          pipelineJobs.delete(job);
+        }, job);
+      } catch (error) {
+        // Before queue ownership, let the final catch retire a partially
+        // registered handle and publish one failure. After queue ownership,
+        // preserve the existing result even if a waiter notification throws.
+        if (!job.queued) job.done = false;
+        throw error;
+      }
+    };
+    // A failure is the callback's to report: it raises no device error and
+    // cannot consume the caller's error scope.
+    try {
+      checkTerminated();
       required(descriptorPtr, 'descriptor');
       const device = get(deviceHandle, 'Device');
       if (!device) throw new Invalid('Invalid device.');
-      const descriptor = describeDescriptor(descriptorPtr);
-      const instance = table.instanceOf(deviceHandle);
-      return device.object[method](descriptor).then(
-        (pipeline) => {
-          const handle = table.insert(kind, { object: pipeline, device }, instance);
-          return handle !== 0
-            ? { status: PipelineStatus.Success, handle }
-            : { status: PipelineStatus.ValidationError, message: 'The pipeline could not be created.' };
-        },
-        (error) => ({
-          status: error?.reason === 'internal' ? PipelineStatus.InternalError : PipelineStatus.ValidationError,
-          message: describe(error),
-        }),
-      );
-    });
+      const instanceHandle = table.instanceOf(deviceHandle);
+      job.instance = table.peek(instanceHandle, 'Instance');
+      if (!job.instance) throw new Invalid('The pipeline instance was released.');
+      if (terminated) {
+        complete(failure(PipelineStatus.InternalError, 'The host was stopped.'));
+        return;
+      }
+      // Every guest pointer is read here, before the call returns; the browser
+      // takes its own copy of the descriptor. A lost device doesn't fail the
+      // creation: as WebGPU says, the browser makes the pipeline, unusable.
+      device.object[method](describeDescriptor(descriptorPtr)).then((pipeline) => {
+        if (job.discarded || disposed) { complete(null); return; }
+        if (table.peek(instanceHandle, 'Instance') !== job.instance) {
+          job.discarded = true; complete(null); return;
+        }
+        if (terminated) {
+          complete(failure(PipelineStatus.InternalError, 'The host was stopped.'));
+          return;
+        }
+        job.handle = table.insert(kind, { object: pipeline, device }, instanceHandle);
+        complete(job.handle !== 0 ? { status: PipelineStatus.Success, handle: job.handle }
+          : failure(PipelineStatus.InternalError, 'The pipeline could not be registered.'));
+      }, (error) => complete(failure(error?.reason === 'internal'
+        ? PipelineStatus.InternalError : PipelineStatus.ValidationError, describe(error)))).catch((error) => {
+        if (job.done) return;
+        if (job.handle) { table.release(job.handle, kind); job.handle = 0; }
+        let message = 'Asynchronous pipeline publication failed.';
+        try { message = describe(error); } catch { /* Host diagnostics are fallible too. */ }
+        complete(failure(PipelineStatus.InternalError, message));
+      });
+    } catch (error) {
+      if (error instanceof GuestFault) { pipelineJobs.delete(job); throw error; }
+      complete(failure(PipelineStatus.ValidationError, describe(error)));
+    }
   };
 
   /**
@@ -2857,7 +2937,12 @@ export function createWebGpuHost({
 
     wasmer_wgpu_yield: suspending ? yieldToBrowser : () => {},
 
-    wasmer_wgpu_instance_release: (handle) => Number(table.release(handle, 'Instance') !== null),
+    wasmer_wgpu_instance_release: (handle) => {
+      const instance = table.release(handle, 'Instance');
+      if (instance === null) return 0;
+      discardPipelines((job) => job.instance === instance);
+      return 1;
+    },
 
     wasmer_wgpu_buffer_release: (handle) => {
       const buffer = table.release(handle, 'Buffer');
@@ -3076,6 +3161,7 @@ export function createWebGpuHost({
     dispose() {
       if (disposed) return;
       disposed = true;
+      discardPipelines(() => true);
       terminate();
       for (const surface of [...surfaces]) closeSurface(surface);
       channel?.port1.close();

@@ -6,6 +6,7 @@
 //! own file implementing the matching generated `*Api` trait.
 
 mod adapter;
+mod async_pipeline;
 mod bind;
 mod buffer;
 mod convert;
@@ -15,6 +16,7 @@ mod events;
 mod instance;
 mod pass;
 mod pipeline;
+mod pipeline_worker;
 mod queue;
 mod scopes;
 mod shader;
@@ -71,6 +73,10 @@ pub(crate) fn log(message: impl FnOnce() -> String) {
 /// Futureless events (uncaptured errors) kept for a guest that does not
 /// collect them, unless the embedder says otherwise.
 const DEFAULT_MAX_PENDING_EVENTS: usize = 4096;
+/// Async pipeline creations a process's compiler lane holds at once: queued,
+/// compiling, or finished but not collected yet. Beyond it, a creation is
+/// compiled on the calling thread.
+const PIPELINE_LANE_CAPACITY: usize = 64;
 
 /// What the embedder-facing context needs from a guest process's host.
 pub(crate) trait HostControl: Any + Send + Sync {
@@ -111,17 +117,25 @@ pub(crate) struct Host {
     /// Bytes of buffer and texture storage currently allocated.
     pub(crate) gpu_memory: Arc<AtomicU64>,
     terminated: AtomicBool,
+    pipelines: pipeline_worker::Worker<async_pipeline::Request, async_pipeline::Outcome>,
 }
 
 impl Host {
     fn new(ctx: Arc<CtxInner>) -> Self {
-        let events = Arc::new(Events::new(
+        let events = Arc::new(Events::with_waker(
             ctx.limits
                 .max_pending_events
                 .or(Some(DEFAULT_MAX_PENDING_EVENTS)),
+            ctx.event_waker.clone(),
         ));
+        let notify = Arc::clone(&events);
+        let pipelines = pipeline_worker::Worker::new(
+            PIPELINE_LANE_CAPACITY,
+            Arc::new(move || notify.notify_work()),
+        );
         Self {
             table: Mutex::new(table::Table::new(ctx.limits.max_objects)),
+            pipelines,
             events,
             devices: Mutex::new(Vec::new()),
             next_device_id: AtomicU64::new(1),
@@ -165,6 +179,7 @@ impl Host {
     /// Stops the process's GPU work: wakes waiters and destroys every device.
     pub(crate) fn terminate(&self) {
         self.terminated.store(true, Ordering::Release);
+        self.pipelines.terminate();
         for device in self.live_devices() {
             device.destroy();
         }
@@ -245,6 +260,15 @@ impl Host {
     /// on in general, so it is only logged; the call returns its error value.
     fn abi_error(&self, function: &'static str, error: &AbiError) {
         log(|| format!("{function}: {error}"));
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        // Worker::drop is nonblocking and owns no Host/guest state. Its native
+        // inputs survive until any in-flight driver call exits and discards.
+        self.terminated.store(true, Ordering::Release);
+        self.pipelines.close();
     }
 }
 
