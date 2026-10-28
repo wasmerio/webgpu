@@ -48,7 +48,6 @@ pub struct WebGpuCtxBuilder {
     force_fallback_adapter: bool,
     #[cfg(not(target_arch = "wasm32"))]
     surfaces: Option<Arc<dyn crate::surface::SurfaceProvider>>,
-    #[cfg(not(target_arch = "wasm32"))]
     event_waker: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(target_arch = "wasm32")]
     canvas_scope: u32,
@@ -99,7 +98,11 @@ impl WebGpuCtxBuilder {
     /// call back into WebGPU, the store or the guest, nor wait for anything a
     /// thread inside WebGPU might hold: a lock such a thread takes, or a
     /// bounded channel it drains. Hold only weak references to what it wakes.
-    #[cfg(not(target_arch = "wasm32"))]
+    ///
+    /// In a browser it runs in the guest's own worker, when a promise of the
+    /// JavaScript host settles (`eventWaker` of `js/webgpu_host.js`). That
+    /// happens only while the worker is free: a guest that blocks its worker
+    /// while it waits is not woken by it.
     pub fn event_waker(mut self, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.event_waker = Some(wake);
         self
@@ -130,7 +133,6 @@ impl WebGpuCtxBuilder {
                     .unwrap_or_else(|| Arc::new(crate::surface::HeadlessSurfaces::default())),
                 #[cfg(not(target_arch = "wasm32"))]
                 hosts: Mutex::new(crate::host::HostRegistry::default()),
-                #[cfg(not(target_arch = "wasm32"))]
                 event_waker: self.event_waker,
                 #[cfg(target_arch = "wasm32")]
                 canvas_scope: self.canvas_scope,
@@ -148,7 +150,7 @@ pub(crate) struct CtxInner {
     /// Host state of every live guest process started through this context.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) hosts: Mutex<crate::host::HostRegistry>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(all(target_arch = "wasm32", not(feature = "js")), allow(dead_code))]
     pub(crate) event_waker: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(target_arch = "wasm32")]
     #[cfg_attr(not(feature = "js"), allow(dead_code))]
