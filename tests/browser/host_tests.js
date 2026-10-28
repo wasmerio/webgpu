@@ -388,6 +388,26 @@ const TESTS = {
       [EVENT.UncapturedError, device, E.ErrorType.Validation, 0n], 'the uncaptured error');
   },
 
+  async 'the embedder hears of each event, and a waker that throws loses none'() {
+    let wakes = 0;
+    const guest = new Guest({
+      eventWaker() {
+        wakes += 1;
+        if (wakes === 1) throw new Error('waker test');
+      },
+    });
+    try {
+      // The wake for the adapter throws: the adapter arrives all the same.
+      const { device } = await guest.device();
+      equal(wakes, 2, 'wakes for an adapter and a device');
+      check(guest.log.includes('eventWaker: waker test'), `not logged: ${guest.log}`);
+      await guest.complete((future) => guest.imports.wasmer_wgpu_device_pop_error_scope(device, future));
+      equal(wakes, 3, 'wakes once an error scope was popped');
+    } finally {
+      guest.host.dispose();
+    }
+  },
+
   async 'a released handle does not come back as another object'(guest) {
     const { imports } = guest;
     const { instance, device } = await guest.device();

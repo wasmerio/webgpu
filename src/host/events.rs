@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::abi::{AbiResult, GuestMemory};
@@ -75,16 +75,27 @@ pub(crate) struct Events {
     /// about to block compares this with what it saw before it looked for
     /// its events: any change means another thread may have collected them.
     epoch: AtomicU64,
+    /// The embedder's waker (`WebGpuCtxBuilder::event_waker`), if any.
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Events {
+    #[cfg(test)]
     pub(crate) fn new(max_pending: Option<usize>) -> Self {
+        Self::with_waker(max_pending, None)
+    }
+
+    pub(crate) fn with_waker(
+        max_pending: Option<usize>,
+        wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         Self {
             ready: Mutex::new(VecDeque::new()),
             pushed: Condvar::new(),
             max_pending,
             dropped: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
+            wake,
         }
     }
 
@@ -111,7 +122,15 @@ impl Events {
         ready.push_back(record);
         self.epoch.fetch_add(1, Ordering::Release);
         drop(ready);
+        self.notify_owner();
+    }
+
+    fn notify_owner(&self) {
         self.pushed.notify_all();
+        if let Some(wake) = &self.wake {
+            // Embedder signaling must not strand GPU futures if it panics.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wake()));
+        }
     }
 
     pub(crate) fn epoch(&self) -> u64 {
@@ -203,5 +222,24 @@ mod tests {
         assert_eq!(events.dropped.load(Ordering::Relaxed), 3);
         assert!(events.is_ready(&[9]));
         assert!(!events.is_ready(&[8]));
+    }
+
+    #[test]
+    fn waker_runs_after_event_mutex_is_released() {
+        let weak = std::sync::OnceLock::<std::sync::Weak<Events>>::new();
+        let shared = Arc::new(weak);
+        let capture = Arc::clone(&shared);
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_in_callback = Arc::clone(&observed);
+        let events = Arc::new(Events::with_waker(
+            None,
+            Some(Arc::new(move || {
+                let events = capture.get().unwrap().upgrade().unwrap();
+                observed_in_callback.store(events.ready.try_lock().is_ok(), Ordering::Release);
+            })),
+        ));
+        assert!(shared.set(Arc::downgrade(&events)).is_ok());
+        events.push(Record::default());
+        assert!(observed.load(Ordering::Acquire));
     }
 }

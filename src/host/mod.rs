@@ -115,10 +115,11 @@ pub(crate) struct Host {
 
 impl Host {
     fn new(ctx: Arc<CtxInner>) -> Self {
-        let events = Arc::new(Events::new(
+        let events = Arc::new(Events::with_waker(
             ctx.limits
                 .max_pending_events
                 .or(Some(DEFAULT_MAX_PENDING_EVENTS)),
+            ctx.event_waker.clone(),
         ));
         Self {
             table: Mutex::new(table::Table::new(ctx.limits.max_objects)),

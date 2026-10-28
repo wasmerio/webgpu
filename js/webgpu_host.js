@@ -425,7 +425,7 @@ function encodeRecord({ future = 0n, kind, status = 0, handle = 0, aux = 0, mess
  * Completed asynchronous work, waiting for the guest to collect it
  * (src/host/events.rs).
  */
-function eventQueue(maxPending) {
+function eventQueue(maxPending, wakeOwner) {
   const ready = [];
   const waiters = new Set();
   let epoch = 0n;
@@ -446,6 +446,7 @@ function eventQueue(maxPending) {
       if (future === 0n && ready.length >= maxPending) return;
       ready.push({ future, bytes: encodeRecord(record) });
       epoch += 1n;
+      wakeOwner();
       for (const wake of [...waiters]) wake();
     },
     isReady(futures) {
@@ -516,6 +517,10 @@ const registeredCanvas = (selector) => globalThis.__wasmerWebGpuCanvases?.get(se
  * - `isTerminated()`: the embedder's kill switch. Once it returns true the
  *   guest's GPU work is stopped, as by `dispose`, but the imports keep
  *   answering the calls a dying guest still makes.
+ * - `eventWaker()`: called whenever an event becomes ready for the guest, so
+ *   that an embedder whose own loop waits on something else can wake it, as
+ *   `WebGpuCtxBuilder::event_waker` does natively. The guest still collects
+ *   the event by polling. It must only signal, not call into the guest.
  * - `limits`: `{ maxObjects, maxDevices, maxPendingEvents, maxGpuMemoryBytes }`,
  *   the ceilings of `WebGpuLimits` on the native host.
  *
@@ -529,6 +534,7 @@ export function createWebGpuHost({
   suspending = typeof WebAssembly.Suspending === 'function',
   forceFallbackAdapter = false,
   isTerminated = () => false,
+  eventWaker = null,
   limits: {
     maxObjects = Infinity,
     maxDevices = Infinity,
@@ -538,7 +544,14 @@ export function createWebGpuHost({
 } = {}) {
   const mem = guestMemory();
   const table = handleTable(maxObjects, log);
-  const events = eventQueue(maxPendingEvents);
+  const events = eventQueue(maxPendingEvents, () => {
+    // A waker that throws must not strand the event: it stays queued.
+    try {
+      eventWaker?.();
+    } catch (error) {
+      log(`eventWaker: ${describe(error)}`);
+    }
+  });
   /** Devices that are not lost, for termination and the device limit. */
   const devices = new Set();
   /** Surfaces whose target has not been released yet. */
