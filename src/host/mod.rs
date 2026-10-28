@@ -24,6 +24,7 @@ mod shim;
 mod surface;
 mod table;
 mod texture;
+mod upload;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -116,6 +117,8 @@ pub(crate) struct Host {
     next_device_id: AtomicU64,
     /// Bytes of buffer and texture storage currently allocated.
     pub(crate) gpu_memory: Arc<AtomicU64>,
+    /// What the staging buffers of large texture uploads may hold.
+    pub(crate) staging: Arc<upload::StagingBudget>,
     terminated: AtomicBool,
     pipelines: pipeline_worker::Worker<async_pipeline::Request, async_pipeline::Outcome>,
 }
@@ -140,6 +143,7 @@ impl Host {
             devices: Mutex::new(Vec::new()),
             next_device_id: AtomicU64::new(1),
             gpu_memory: Arc::new(AtomicU64::new(0)),
+            staging: Arc::new(upload::StagingBudget::new(ctx.limits.max_gpu_memory_bytes)),
             terminated: AtomicBool::new(ctx.stopped.load(Ordering::Acquire)),
             ctx,
         }
