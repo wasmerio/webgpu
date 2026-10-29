@@ -46,6 +46,14 @@ pub(crate) use instance::InstanceState;
 pub(crate) use surface::SurfaceState;
 pub(crate) use texture::TextureState;
 
+/// Whether the tests should ask for a software adapter:
+/// `WEBGPU_TEST_FALLBACK_ADAPTER` set to anything but nothing or `0`.
+#[cfg(test)]
+pub(crate) fn test_fallback_adapter() -> bool {
+    std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 /// Async pipeline creations a process's compiler lane holds at once: queued,
 /// compiling, or finished but not collected yet. Beyond it, a creation is
 /// compiled on the calling thread.

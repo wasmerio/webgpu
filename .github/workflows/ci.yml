@@ -85,7 +85,8 @@ jobs:
         include:
           # As for the wgpu host, Mesa's software Vulkan stands in for a GPU,
           # but not as a fallback adapter: Dawn's only one is SwiftShader. As
-          # the runner's only adapter, Dawn hands it out anyway.
+          # the runner's only adapter, Dawn hands it out anyway. (The tests
+          # take an empty WEBGPU_TEST_FALLBACK_ADAPTER as unset.)
           - os: ubuntu-24.04
             fallback_adapter: ""
             test: make test-dawn

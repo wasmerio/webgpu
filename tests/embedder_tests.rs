@@ -27,9 +27,15 @@ fn program(name: &str) -> PathBuf {
     root.join(format!("tests/programs/out/{name}.wasm"))
 }
 
+/// `WEBGPU_TEST_FALLBACK_ADAPTER` set to anything but nothing or `0`, as for
+/// `manifest_tests`.
+fn fallback_adapter() -> bool {
+    std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 fn builder() -> WebGpuCtxBuilder {
-    WebGpuCtx::builder()
-        .force_fallback_adapter(std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER").is_some())
+    WebGpuCtx::builder().force_fallback_adapter(fallback_adapter())
 }
 
 fn run(ctx: &WebGpuCtx, name: &str) -> RunOutput {
@@ -125,7 +131,7 @@ fn a_surface_moved_to_another_device_presents_what_that_device_drew() {
 fn encoder_timestamps_written() -> bool {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        force_fallback_adapter: std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER").is_some(),
+        force_fallback_adapter: fallback_adapter(),
         ..Default::default()
     }))
     .expect("an adapter for the tests");

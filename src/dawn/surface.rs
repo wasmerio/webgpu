@@ -425,6 +425,11 @@ impl Host {
         let Some(state) = SurfaceState::of(&object) else {
             return;
         };
+        // Configuring first unconfigures, as the surface contract says,
+        // whatever comes of the new configuration: the current frame is gone
+        // even when the device or the configuration is refused below.
+        let mut inner = lock(&state.inner);
+        state.unconfigure(&mut inner);
         let Some(device_object) = self.object(config.device, Kind::Device) else {
             return;
         };
@@ -462,9 +467,6 @@ impl Host {
             None => Default::default(),
         };
 
-        let mut inner = lock(&state.inner);
-        // Reconfiguring first unconfigures: the current frame is gone.
-        state.unconfigure(&mut inner);
         match &state.backing {
             Backing::Window { raw, .. } => {
                 // Saying so beats showing the wrong colours.

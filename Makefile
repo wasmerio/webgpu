@@ -73,7 +73,7 @@ check-web:
 test: test-native
 
 ## Unit tests, the ABI sweep, the conformance programs and the embedder tests.
-## WEBGPU_TEST_FALLBACK_ADAPTER=1 runs them on a software adapter.
+## WEBGPU_TEST_FALLBACK_ADAPTER=1 runs them on a software adapter (empty or 0: off).
 test-native: programs
 	$(CARGO) test --features cli
 

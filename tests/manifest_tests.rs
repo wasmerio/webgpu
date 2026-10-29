@@ -4,7 +4,9 @@
 //! The programs are C, built for WASIX with `tests/build-test-wasix.sh`
 //! (needs `wasixcc`). They need a GPU adapter; on a machine without one, set
 //! `WEBGPU_TEST_FALLBACK_ADAPTER=1` to ask for a software adapter (lavapipe,
-//! WARP) instead. `WEBGPU_TEST_FILTER=<substring>` runs a subset.
+//! WARP) instead (empty or `0` is the same as unset). The Dawn host has no
+//! such fallback; it picks a software adapter when that is the only one (see
+//! docs/dawn.md). `WEBGPU_TEST_FILTER=<substring>` runs a subset.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,7 +52,8 @@ fn manifest_programs_print_what_the_manifest_says() {
     )
     .expect("manifest parses");
     let filter = std::env::var("WEBGPU_TEST_FILTER").ok();
-    let fallback = std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER").is_some();
+    let fallback = std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER")
+        .is_some_and(|value| !value.is_empty() && value != "0");
 
     let mut failures = Vec::new();
     let mut ran = 0;

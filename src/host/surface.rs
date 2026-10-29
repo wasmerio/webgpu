@@ -373,6 +373,11 @@ impl SurfaceApi for Host {
         let Some(state) = self.surface(surface) else {
             return;
         };
+        // Configuring first unconfigures, as the surface contract says,
+        // whatever comes of the new configuration: the current frame is gone
+        // even when the device or the configuration is refused below.
+        let mut inner = lock(&state.inner);
+        inner.retire();
         let Some(device) = self.device(config.device) else {
             return;
         };
@@ -414,9 +419,6 @@ impl SurfaceApi for Host {
             None => Default::default(),
         };
 
-        let mut inner = lock(&state.inner);
-        // Reconfiguring first unconfigures: the current frame is gone.
-        inner.retire();
         match &state.backing {
             Backing::Window { surface, .. } => {
                 // The backend presents a window in sRGB and has no way to

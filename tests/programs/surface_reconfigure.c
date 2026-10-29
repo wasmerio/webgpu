@@ -1,8 +1,9 @@
-// Ending a surface's configuration: Unconfigure, and Configure replacing it,
-// destroy the frame a program acquired and did not present, though it still
-// holds the texture; and a surface configured for another device presents
-// what that device drew. The embedder tests run this against a capturing
-// target and check that the last frame is the second device's green.
+// Ending a surface's configuration: Unconfigure, and Configure replacing it
+// (even with a configuration that is refused), destroy the frame a program
+// acquired and did not present, though it still holds the texture; and a
+// surface configured for another device presents what that device drew. The
+// embedder tests run this against a capturing target and check that the last
+// frame is the second device's green.
 
 #include "wgpu_test.h"
 
@@ -13,6 +14,15 @@ static WGPUTexture acquire(WGPUSurface surface) {
           frame.status == WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal);
     CHECK(frame.texture != NULL);
     return frame.texture;
+}
+
+// Whether the surface hands out a frame now (one it hands out is released).
+static bool has_frame(WGPUSurface surface) {
+    WGPUSurfaceTexture frame = WGPU_SURFACE_TEXTURE_INIT;
+    wgpuSurfaceGetCurrentTexture(surface, &frame);
+    if (frame.texture == NULL) return false;
+    wgpuTextureRelease(frame.texture);
+    return true;
 }
 
 static void on_scope(WGPUPopErrorScopeStatus status, WGPUErrorType type, WGPUStringView message, void* userdata1,
@@ -58,6 +68,22 @@ static const char* clear(WGPUInstance instance, WGPUDevice device, WGPUTexture t
         case WGPUErrorType_Validation: return "destroyed";
         default: return "unexpected error";
     }
+}
+
+static const char* error_name(WGPUErrorType type) {
+    switch (type) {
+        case WGPUErrorType_NoError: return "no error";
+        case WGPUErrorType_Validation: return "validation error";
+        default: return "unexpected error";
+    }
+}
+
+// Configures the surface and says what error that was for `device`.
+static const char* configure(WGPUInstance instance, WGPUDevice device, WGPUSurface surface,
+                             const WGPUSurfaceConfiguration* configuration) {
+    wgpuDevicePushErrorScope(device, WGPUErrorFilter_Validation);
+    wgpuSurfaceConfigure(surface, configuration);
+    return error_name(pop_error(instance, device));
 }
 
 // Presents the current frame: "presented", or what went wrong for the device
@@ -113,6 +139,22 @@ int main(void) {
     wgpuSurfaceConfigure(surface, &configuration);
     printf("a frame held past Configure: %s\n", clear(instance, first, held, (WGPUColor){ 1, 0, 0, 1 }));
     wgpuTextureRelease(held);
+
+    // A Configure that is refused still unconfigures first: the frame out is
+    // destroyed, and the surface has no configuration to hand frames out for.
+    held = acquire(surface);
+    WGPUSurfaceConfiguration empty = configuration;
+    empty.width = 0;
+    printf("a frame held past a Configure of size 0: %s, ", configure(instance, first, surface, &empty));
+    printf("%s\n", clear(instance, first, held, (WGPUColor){ 1, 0, 0, 1 }));
+    wgpuTextureRelease(held);
+    wgpuSurfaceConfigure(surface, &configuration);
+    WGPUSurfaceConfiguration formatless = configuration;
+    formatless.format = WGPUTextureFormat_Undefined;
+    printf("a Configure without a format: %s, ", configure(instance, first, surface, &formatless));
+    printf("%s\n", has_frame(surface) ? "still configured" : "unconfigured");
+
+    wgpuSurfaceConfigure(surface, &configuration);
     WGPUTexture frame = acquire(surface);
     printf("red from the first device: %s, ", clear(instance, first, frame, (WGPUColor){ 1, 0, 0, 1 }));
     printf("%s\n", present(instance, first, surface));

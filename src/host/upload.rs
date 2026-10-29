@@ -695,7 +695,7 @@ mod native_gpu_tests {
         let host = Host::new(Arc::clone(&builder.build().inner));
         let native = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(native.request_adapter(&wgpu::RequestAdapterOptions {
-            force_fallback_adapter: std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER").is_some(),
+            force_fallback_adapter: crate::host::test_fallback_adapter(),
             ..Default::default()
         }))
         .expect("native GPU adapter is required, never silently skip");
