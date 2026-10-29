@@ -6,17 +6,21 @@
 //! mapping and guest memory in one copy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::callbacks::{self, Map, Pending};
 use super::ffi::{self, Kind};
 use super::lower::Lowering;
-use super::{Extra, Host, Native, Record, lock};
+use super::{Extra, Host, Native, Record, charge, exclusive, lock, refund, shared};
 use crate::abi::enums::{
     BufferMapState, CallbackMode, ErrorType, MapAsyncStatus, Status, map_mode,
 };
 use crate::abi::structs::BufferDescriptor;
 use crate::abi::{AbiEnum, Cx, EVENT_BUFFER_MAP, Handle};
+
+/// The generation of a map request the host knows Dawn will refuse: never
+/// the buffer's current one.
+pub(super) const REFUSED_MAP: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MapInfo {
@@ -32,6 +36,12 @@ pub(crate) struct MapInfo {
 pub(crate) struct BufferState {
     pub(crate) size: u64,
     pub(crate) map: Arc<Mutex<MapInfo>>,
+    /// Held shared while bytes are copied to or from the mapping, and
+    /// exclusively while Dawn unmaps or destroys the buffer: either frees the
+    /// mapping, and Dawn keeps nothing alive for a pointer it handed out.
+    /// (Not `map`: Dawn runs the map callback, which takes that, inside
+    /// Unmap and Destroy.)
+    access: RwLock<()>,
     /// Bytes this object still counts for against the guest's budget.
     accounted: AtomicU64,
     gpu_memory: Arc<AtomicU64>,
@@ -47,8 +57,7 @@ impl BufferState {
     /// Gives the object's bytes back to the guest's budget, once: when the
     /// guest destroys it, or else when its last reference goes.
     pub(crate) fn release_storage(&self) {
-        let bytes = self.accounted.swap(0, Ordering::Relaxed);
-        self.gpu_memory.fetch_sub(bytes, Ordering::Relaxed);
+        refund(&self.gpu_memory, self.accounted.swap(0, Ordering::Relaxed));
     }
 
     pub(crate) fn of(object: &Native) -> Option<&BufferState> {
@@ -87,6 +96,7 @@ impl BufferState {
         Self {
             size,
             map: Arc::new(Mutex::new(map)),
+            access: RwLock::new(()),
             accounted: AtomicU64::new(0),
             gpu_memory: Arc::new(AtomicU64::new(0)),
         }
@@ -139,8 +149,7 @@ impl Host {
         if raw.is_null() {
             return 0;
         }
-        self.gpu_memory
-            .fetch_add(descriptor.size, Ordering::Relaxed);
+        charge(&self.gpu_memory, descriptor.size);
         let map = MapInfo {
             state: if descriptor.mapped_at_creation {
                 BufferMapState::Mapped
@@ -168,6 +177,7 @@ impl Host {
                 extra: Extra::Buffer(BufferState {
                     size: descriptor.size,
                     map: Arc::new(Mutex::new(map)),
+                    access: RwLock::new(()),
                     accounted: AtomicU64::new(descriptor.size),
                     gpu_memory: Arc::clone(&self.gpu_memory),
                 }),
@@ -210,7 +220,6 @@ impl Host {
         };
         let generation = {
             let mut map = lock(&state.map);
-            // A request Dawn will refuse leaves the current mapping as it is.
             if map.state == BufferMapState::Unmapped
                 && offset
                     .checked_add(size)
@@ -224,8 +233,12 @@ impl Host {
                     size,
                     generation: map.generation,
                 };
+                map.generation
+            } else {
+                // A request Dawn will refuse leaves the current mapping (or
+                // the one pending) as it is: its callback must not settle it.
+                REFUSED_MAP
             }
-            map.generation
         };
         let context = Map {
             pending: Pending::new(&self.events, &self.futures, future),
@@ -263,6 +276,65 @@ impl Host {
         Some(out)
     }
 
+    /// Copies between the current mapping and guest memory: into the mapping
+    /// for a write, out of it otherwise. The buffer's and its device's access
+    /// locks are held throughout, so another guest thread's Unmap or Destroy,
+    /// or the device's destruction, waits until the copy is done.
+    fn copy_mapped(
+        &self,
+        cx: &mut Cx<'_>,
+        buffer: Handle,
+        offset: u32,
+        data: u32,
+        size: u32,
+        write: bool,
+    ) -> Status {
+        let Some(object) = self.object(buffer, Kind::Buffer) else {
+            return Status::Error;
+        };
+        let Some(state) = BufferState::of(&object) else {
+            return Status::Error;
+        };
+        let _device = object.device.as_ref().map(|device| shared(&device.access));
+        let _buffer = shared(&state.access);
+        let Some((start, len, skip)) = state.window(u64::from(offset), u64::from(size), write)
+        else {
+            return Status::Error;
+        };
+        if size == 0 {
+            return Status::Success;
+        }
+        // SAFETY: a mapped buffer (for writing, to write); the range lies
+        // within the mapping, which the locks above keep.
+        let mapped = unsafe {
+            if write {
+                ffi::wgpuBufferGetMappedRange(object.raw.cast(), start as usize, len as usize)
+            } else {
+                ffi::wgpuBufferGetConstMappedRange(object.raw.cast(), start as usize, len as usize)
+                    .cast_mut()
+            }
+        };
+        if mapped.is_null() {
+            return Status::Error;
+        }
+        let copied = cx.mem.with_host_bytes(data, u64::from(size), |guest| {
+            // SAFETY: `size` bytes at `skip` of the mapped range and `size`
+            // in-bounds guest bytes; the two never overlap.
+            unsafe {
+                let mapped = mapped.cast::<u8>().add(skip);
+                if write {
+                    std::ptr::copy_nonoverlapping(guest, mapped, size as usize)
+                } else {
+                    std::ptr::copy_nonoverlapping(mapped, guest, size as usize)
+                }
+            }
+        });
+        match copied {
+            Ok(()) => Status::Success,
+            Err(_) => Status::Error,
+        }
+    }
+
     pub(crate) fn manual_buffer_read_mapped_range(
         &self,
         cx: &mut Cx<'_>,
@@ -271,37 +343,7 @@ impl Host {
         data: u32,
         size: u32,
     ) -> Status {
-        let Some(object) = self.object(buffer, Kind::Buffer) else {
-            return Status::Error;
-        };
-        let Some(state) = BufferState::of(&object) else {
-            return Status::Error;
-        };
-        let Some((start, len, skip)) = state.window(u64::from(offset), u64::from(size), false)
-        else {
-            return Status::Error;
-        };
-        if size == 0 {
-            return Status::Success;
-        }
-        // SAFETY: a mapped buffer; the range lies within the mapping.
-        let mapped = unsafe {
-            ffi::wgpuBufferGetConstMappedRange(object.raw.cast(), start as usize, len as usize)
-        };
-        if mapped.is_null() {
-            return Status::Error;
-        }
-        let copied = cx.mem.with_host_bytes(data, u64::from(size), |guest| {
-            // SAFETY: `size` bytes at `skip` of the mapped range, into `size`
-            // in-bounds guest bytes; the two never overlap.
-            unsafe {
-                std::ptr::copy_nonoverlapping(mapped.cast::<u8>().add(skip), guest, size as usize)
-            }
-        });
-        match copied {
-            Ok(()) => Status::Success,
-            Err(_) => Status::Error,
-        }
+        self.copy_mapped(cx, buffer, offset, data, size, false)
     }
 
     pub(crate) fn manual_buffer_write_mapped_range(
@@ -312,37 +354,7 @@ impl Host {
         data: u32,
         size: u32,
     ) -> Status {
-        let Some(object) = self.object(buffer, Kind::Buffer) else {
-            return Status::Error;
-        };
-        let Some(state) = BufferState::of(&object) else {
-            return Status::Error;
-        };
-        let Some((start, len, skip)) = state.window(u64::from(offset), u64::from(size), true)
-        else {
-            return Status::Error;
-        };
-        if size == 0 {
-            return Status::Success;
-        }
-        // SAFETY: a buffer mapped for writing; the range lies within the mapping.
-        let mapped = unsafe {
-            ffi::wgpuBufferGetMappedRange(object.raw.cast(), start as usize, len as usize)
-        };
-        if mapped.is_null() {
-            return Status::Error;
-        }
-        let copied = cx.mem.with_host_bytes(data, u64::from(size), |guest| {
-            // SAFETY: `size` in-bounds guest bytes into `size` bytes at `skip`
-            // of the mapped range; the two never overlap.
-            unsafe {
-                std::ptr::copy_nonoverlapping(guest, mapped.cast::<u8>().add(skip), size as usize)
-            }
-        });
-        match copied {
-            Ok(()) => Status::Success,
-            Err(_) => Status::Error,
-        }
+        self.copy_mapped(cx, buffer, offset, data, size, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -398,23 +410,30 @@ impl Host {
     }
 
     pub(crate) fn manual_buffer_unmap(&self, _cx: &mut Cx<'_>, buffer: Handle) {
-        if let Some(object) = self.object(buffer, Kind::Buffer) {
-            if let Some(state) = BufferState::of(&object) {
-                state.end_mapping();
-            }
-            // SAFETY: a live buffer.
-            unsafe { ffi::wgpuBufferUnmap(object.raw.cast()) };
+        let Some(object) = self.object(buffer, Kind::Buffer) else {
+            return;
+        };
+        let state = BufferState::of(&object);
+        // No copy is under way while Dawn frees the mapping.
+        let _buffer = state.map(|state| exclusive(&state.access));
+        if let Some(state) = state {
+            state.end_mapping();
         }
+        // SAFETY: a live buffer.
+        unsafe { ffi::wgpuBufferUnmap(object.raw.cast()) };
     }
 
     pub(crate) fn manual_buffer_destroy(&self, _cx: &mut Cx<'_>, buffer: Handle) {
-        if let Some(object) = self.object(buffer, Kind::Buffer) {
-            if let Some(state) = BufferState::of(&object) {
-                state.end_mapping();
-                state.release_storage();
-            }
-            // SAFETY: a live buffer.
-            unsafe { ffi::wgpuBufferDestroy(object.raw.cast()) };
+        let Some(object) = self.object(buffer, Kind::Buffer) else {
+            return;
+        };
+        let state = BufferState::of(&object);
+        let _buffer = state.map(|state| exclusive(&state.access));
+        if let Some(state) = state {
+            state.end_mapping();
+            state.release_storage();
         }
+        // SAFETY: a live buffer.
+        unsafe { ffi::wgpuBufferDestroy(object.raw.cast()) };
     }
 }

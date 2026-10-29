@@ -10,7 +10,7 @@
 //! object: the callback hands it to the host, which gives it a handle the
 //! next time a guest thread polls or waits (see `Host::publish_pipelines`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
@@ -20,34 +20,57 @@ use super::{DeviceState, Events, Record, lock, text};
 use crate::abi::enums::{BufferMapState, CompilationInfoRequestStatus, MapAsyncStatus};
 use crate::abi::{AbiEnum, EVENT_BUFFER_MAP, EVENT_COMPILATION_INFO, Handle};
 
+/// Guest futures whose Dawn future has not completed yet, and Dawn's id for
+/// each.
+#[derive(Default)]
+struct FutureMap {
+    pending: HashMap<u64, u64>,
+    /// Futures whose callback ran before the call that started them returned
+    /// (Dawn completes an event that is already ready inside that call):
+    /// `track` then has nothing to record.
+    finished_early: HashSet<u64>,
+}
+
 /// The Dawn futures behind guest futures that are still pending, so a guest
 /// waiting for some of them can wait inside Dawn for exactly those.
 #[derive(Default)]
 pub(crate) struct Futures {
-    pending: Arc<Mutex<HashMap<u64, u64>>>,
+    map: Arc<Mutex<FutureMap>>,
 }
 
 impl Futures {
+    /// Records the Dawn future a call started for `guest`, unless its
+    /// callback has run already.
     pub(crate) fn track(&self, guest: u64, dawn: ffi::WGPUFuture) {
+        let mut map = lock(&self.map);
+        if map.finished_early.remove(&guest) {
+            return;
+        }
         if guest != 0 && dawn.id != 0 {
-            lock(&self.pending).insert(guest, dawn.id);
+            map.pending.insert(guest, dawn.id);
         }
     }
 
     /// Dawn's ids of the listed guest futures that are still pending.
     pub(crate) fn dawn_ids(&self, guest: &[u64]) -> Vec<u64> {
-        let pending = lock(&self.pending);
+        let map = lock(&self.map);
         guest
             .iter()
-            .filter_map(|future| pending.get(future).copied())
+            .filter_map(|future| map.pending.get(future).copied())
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len_for_test(&self) -> usize {
+        let map = lock(&self.map);
+        map.pending.len() + map.finished_early.len()
     }
 }
 
 /// What every callback needs to report its future.
 pub(crate) struct Pending {
     events: Arc<Events>,
-    futures: Arc<Mutex<HashMap<u64, u64>>>,
+    futures: Arc<Mutex<FutureMap>>,
     pub(crate) future: u64,
 }
 
@@ -55,13 +78,22 @@ impl Pending {
     pub(crate) fn new(events: &Arc<Events>, futures: &Futures, future: u64) -> Self {
         Self {
             events: Arc::clone(events),
-            futures: Arc::clone(&futures.pending),
+            futures: Arc::clone(&futures.map),
             future,
         }
     }
 
+    /// Forgets the future's Dawn id: it no longer needs waiting for. A
+    /// callback that runs before `track` leaves a mark for it instead.
+    fn settle(&self) {
+        let mut map = lock(&self.futures);
+        if map.pending.remove(&self.future).is_none() {
+            map.finished_early.insert(self.future);
+        }
+    }
+
     fn finish(&self, record: Record) {
-        lock(&self.futures).remove(&self.future);
+        self.settle();
         self.events.push(record);
     }
 }
@@ -254,6 +286,17 @@ pub(crate) struct DonePipeline {
 // SAFETY: a Dawn object, which may move between threads.
 unsafe impl Send for DonePipeline {}
 
+impl Drop for DonePipeline {
+    /// A pipeline nobody gave a handle (its host went first) is released
+    /// here; one that was published has had `raw` taken.
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            // SAFETY: the reference Dawn handed the callback.
+            unsafe { self.kind.release(self.raw) };
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DonePipelines {
     pub(crate) list: Mutex<Vec<DonePipeline>>,
@@ -278,7 +321,7 @@ pub(crate) unsafe extern "C" fn pipeline(
 ) {
     // SAFETY: the context boxed for this callback.
     let request = unsafe { take::<PipelineRequest>(userdata1) };
-    lock(&request.pending.futures).remove(&request.pending.future);
+    request.pending.settle();
     lock(&request.done.list).push(DonePipeline {
         future: request.pending.future,
         event: request.event,

@@ -142,7 +142,10 @@ fn window_surface(
                 ..Default::default()
             };
             source.chain.sType = g::SurfaceSourceMetalLayer::S_TYPE;
-            create((&source as *const ffi::WGPUSurfaceSourceMetalLayer).cast())
+            let surface = create((&source as *const ffi::WGPUSurfaceSourceMetalLayer).cast());
+            // The view and Dawn's surface hold the layer now.
+            release(layer);
+            surface
         }
         (RawWindowHandle::Xlib(handle), RawDisplayHandle::Xlib(display)) => {
             let mut source = ffi::WGPUSurfaceSourceXlibWindow {
@@ -212,6 +215,17 @@ fn metal_layer(view: *mut c_void) -> *mut c_void {
             let _: () = msg_send![layer, setContentsScale: scale];
         }
         layer.cast()
+    }
+}
+
+/// Releases the reference `metal_layer` made the layer with.
+#[cfg(target_os = "macos")]
+fn release(object: *mut c_void) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    // SAFETY: an object the caller holds a reference to.
+    unsafe {
+        let _: () = msg_send![object.cast::<AnyObject>(), release];
     }
 }
 
@@ -437,6 +451,13 @@ impl Host {
                 if !HEADLESS_FORMATS.contains(&config.format) {
                     drop(inner);
                     return fail("this surface does not support that format.");
+                }
+                let mut limits = ffi::WGPULimits::default();
+                // SAFETY: a live device and a struct for Dawn to fill.
+                unsafe { ffi::wgpuDeviceGetLimits(device.raw, &mut limits) };
+                if config.width.max(config.height) > limits.maxTextureDimension2D {
+                    drop(inner);
+                    return fail("the size exceeds the device's maxTextureDimension2D.");
                 }
             }
         }
@@ -683,9 +704,12 @@ fn read_back(
     let dawn = host.dawn()?;
     let device = configured.device.raw;
     let (width, height) = (configured.width, configured.height);
-    let row = width as usize * 4;
-    let padded = row.div_ceil(256) * 256;
-    let size = (padded * height as usize) as u64;
+    let row = (width as usize).checked_mul(4)?;
+    let padded = row.div_ceil(256).checked_mul(256)?;
+    let size = u64::try_from(padded.checked_mul(height as usize)?).ok()?;
+    // The device's destruction (another thread's, or the embedder's) waits
+    // for this copy: it would free the mapping.
+    let _copies = super::shared(&configured.device.access);
     let buffer = match cache.take() {
         Some((cached, buffer)) if cached == size => buffer,
         other => {

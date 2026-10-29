@@ -18,7 +18,7 @@ use super::{Extra, Host, Native, Record, lock};
 use crate::abi::api::ShimApi;
 use crate::abi::enums::{
     CallbackMode, CreatePipelineAsyncStatus, DeviceLostReason, ErrorType, PopErrorScopeStatus,
-    RequestAdapterStatus, RequestDeviceStatus,
+    RequestAdapterStatus, RequestDeviceStatus, WaitStatus,
 };
 use crate::abi::structs::{
     ComputePipelineDescriptor, DeviceDescriptor, RenderPipelineDescriptor, RequestAdapterOptions,
@@ -81,19 +81,20 @@ impl Host {
     /// A pipeline whose instance the guest released meanwhile goes with it.
     fn publish_pipelines(&self) {
         let done = std::mem::take(&mut *lock(&self.pipelines.list));
-        for pipeline in done {
-            let live = self.object(pipeline.instance, Kind::Instance).is_some();
-            let object = (!pipeline.raw.is_null()).then(|| {
+        for mut pipeline in done {
+            // A pipeline whose instance is gone is dropped, which releases it.
+            if self.object(pipeline.instance, Kind::Instance).is_none() {
+                continue;
+            }
+            let raw = std::mem::replace(&mut pipeline.raw, std::ptr::null_mut());
+            let object = (!raw.is_null()).then(|| {
                 Arc::new(Native {
                     kind: pipeline.kind,
-                    raw: pipeline.raw,
+                    raw,
                     device: Some(Arc::clone(&pipeline.device)),
                     extra: Extra::None,
                 })
             });
-            if !live {
-                continue;
-            }
             let handle = object.map_or(0, |object| self.insert(object, pipeline.instance));
             let status =
                 if pipeline.status == CreatePipelineAsyncStatus::Success.as_u32() && handle == 0 {
@@ -106,7 +107,7 @@ impl Host {
                 kind: pipeline.event,
                 status,
                 handle,
-                message: pipeline.message,
+                message: std::mem::take(&mut pipeline.message),
                 pipeline_instance: pipeline.instance,
                 ..Record::default()
             });
@@ -503,7 +504,7 @@ impl ShimApi for Host {
             // event.
             let mut ids = self.futures.dawn_ids(&futures);
             ids.truncate(TIMED_WAIT_ANY_MAX_COUNT as usize);
-            match self.dawn.get().and_then(Option::as_ref) {
+            let waited = match self.dawn.get().and_then(Option::as_ref) {
                 Some(dawn) if !ids.is_empty() => {
                     let mut waits: Vec<_> = ids
                         .into_iter()
@@ -513,7 +514,7 @@ impl ShimApi for Host {
                         })
                         .collect();
                     // SAFETY: the host's live instance and futures it started.
-                    unsafe {
+                    let status = unsafe {
                         ffi::wgpuInstanceWaitAny(
                             dawn.0,
                             waits.len(),
@@ -521,8 +522,19 @@ impl ShimApi for Host {
                             slice.as_nanos() as u64,
                         )
                     };
+                    // Dawn may be unable to wait on this mix of futures at
+                    // once (several queues, or a queue's with another kind,
+                    // on backends without spontaneous queue events): it says
+                    // so at once, and the queue below waits instead.
+                    matches!(
+                        WaitStatus::from_u32(status),
+                        Some(WaitStatus::Success | WaitStatus::TimedOut)
+                    )
                 }
-                _ => self.events.wait_for_push(slice, epoch),
+                _ => false,
+            };
+            if !waited {
+                self.events.wait_for_push(slice, epoch);
             }
         }
         self.events.drain_into(&cx.mem, buf, cap)

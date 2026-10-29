@@ -19,6 +19,13 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC=${DAWN_SOURCE:-$ROOT/third_party/dawn/src}
 OUT=${DAWN_BUILD:-$ROOT/third_party/dawn/out}
 PREFIX=${1:-$ROOT/third_party/dawn/install}
+STAMP=$PREFIX/.dawn-revision
+
+# An install of this revision is kept (a cache CI restores, for one).
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$DAWN_REVISION" ] && [ -f "$PREFIX/include/webgpu/webgpu.h" ]; then
+    echo "Dawn $DAWN_REVISION is already installed in $PREFIX"
+    exit 0
+fi
 
 if [ ! -d "$SRC/.git" ]; then
     mkdir -p "$(dirname "$SRC")"
@@ -83,4 +90,5 @@ fi
 
 cmake --build "$OUT"
 cmake --install "$OUT"
+echo "$DAWN_REVISION" > "$STAMP"
 echo "Dawn $DAWN_REVISION installed in $PREFIX"

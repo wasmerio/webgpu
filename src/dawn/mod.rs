@@ -40,7 +40,7 @@ mod texture;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use wasmer::StoreMut;
 
@@ -264,10 +264,14 @@ impl Host {
         self.insert(object, self.instance_of(parent_handle))
     }
 
-    pub(crate) fn add_ref_handle(&self, handle: Handle, kind: Kind) {
-        if !lock(&self.table).add_ref(handle, kind) {
+    /// Adds a guest reference. Returns whether `handle` was a live object of
+    /// this kind.
+    pub(crate) fn add_ref_handle(&self, handle: Handle, kind: Kind) -> bool {
+        let added = lock(&self.table).add_ref(handle, kind);
+        if !added {
             log(|| format!("AddRef on an invalid {kind:?} handle {handle:#x}"));
         }
+        added
     }
 
     /// Drops one guest reference. Returns the object when that was the last
@@ -312,6 +316,31 @@ impl Drop for Host {
     fn drop(&mut self) {
         self.terminated.store(true, Ordering::Release);
     }
+}
+
+/// Takes a lock shared, ignoring poisoning (see [`lock`]).
+pub(crate) fn shared(lock: &RwLock<()>) -> RwLockReadGuard<'_, ()> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Takes a lock exclusively, ignoring poisoning (see [`lock`]).
+pub(crate) fn exclusive(lock: &RwLock<()>) -> RwLockWriteGuard<'_, ()> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Counts `bytes` against the guest's GPU memory, saturating.
+pub(crate) fn charge(counter: &AtomicU64, bytes: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        Some(used.saturating_add(bytes))
+    });
+}
+
+/// Gives `bytes` back, saturating.
+pub(crate) fn refund(counter: &AtomicU64, bytes: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        Some(used.saturating_sub(bytes))
+    });
 }
 
 /// A string view of `text` for a call that returns before `text` goes.

@@ -24,7 +24,7 @@ impl Drop for TextureState {
 
 impl TextureState {
     pub(crate) fn new(bytes: u64, gpu_memory: &Arc<AtomicU64>) -> Self {
-        gpu_memory.fetch_add(bytes, Ordering::Relaxed);
+        super::charge(gpu_memory, bytes);
         Self {
             accounted: AtomicU64::new(bytes),
             gpu_memory: Arc::clone(gpu_memory),
@@ -32,8 +32,7 @@ impl TextureState {
     }
 
     pub(crate) fn release_storage(&self) {
-        let bytes = self.accounted.swap(0, Ordering::Relaxed);
-        self.gpu_memory.fetch_sub(bytes, Ordering::Relaxed);
+        super::refund(&self.gpu_memory, self.accounted.swap(0, Ordering::Relaxed));
     }
 
     pub(crate) fn of(object: &Native) -> Option<&TextureState> {
@@ -144,8 +143,8 @@ pub(crate) fn texture_bytes(
 ) -> u64 {
     let (bytes, block_width, block_height) = block(format);
     let blocks = u64::from(width.div_ceil(block_width.max(1)))
-        * u64::from(height.div_ceil(block_height.max(1)))
-        * u64::from(layers.max(1));
+        .saturating_mul(u64::from(height.div_ceil(block_height.max(1))))
+        .saturating_mul(u64::from(layers.max(1)));
     let base = blocks
         .saturating_mul(bytes.max(1))
         .saturating_mul(u64::from(samples.max(1)));

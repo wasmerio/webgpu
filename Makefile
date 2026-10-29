@@ -82,10 +82,8 @@ test-dawn: programs dawn
 	$(CARGO) test --features cli,dawn
 
 ## Dawn for the `dawn` feature, at the pinned revision: third_party/dawn/install.
-## Skipped when already installed; delete third_party/dawn/install to rebuild.
-dawn: third_party/dawn/install/include/webgpu/webgpu.h
-
-third_party/dawn/install/include/webgpu/webgpu.h: scripts/build-dawn.sh
+## Quick when that revision is installed already (the script checks).
+dawn:
 	scripts/build-dawn.sh
 
 ## The conformance programs against js/webgpu_host.js, and the runtime hooks

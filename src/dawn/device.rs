@@ -2,14 +2,14 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::adapter::{AdapterState, standard_features, write_limits};
 use super::dawn_ext::{FEATURE_IMPLICIT_DEVICE_SYNCHRONIZATION, wgpuDeviceInjectError};
 use super::ffi::{self, Kind};
 use super::lower::Lowering;
-use super::{Events, Extra, Host, Native, Record, lock, text, view};
-use crate::abi::enums::{CallbackMode, DeviceLostReason, ErrorType, Status};
+use super::{Events, Extra, Host, Native, Record, exclusive, lock, text, view};
+use crate::abi::enums::{CallbackMode, DeviceLostReason, ErrorType, FeatureName, Status};
 use crate::abi::structs::{DeviceDescriptor, Limits};
 use crate::abi::{AbiEnum, Cx, EVENT_DEVICE_LOST, EVENT_UNCAPTURED_ERROR, Handle, OutPtr};
 
@@ -90,6 +90,10 @@ pub(crate) struct DeviceState {
     /// The guest's queue handle while it holds one, so `wgpuDeviceGetQueue`
     /// keeps returning the same value.
     queue_handle: Mutex<Handle>,
+    /// Held shared while the host copies to or from one of the device's
+    /// mappings, exclusively while Dawn destroys the device (which frees
+    /// them all).
+    pub(crate) access: RwLock<()>,
 }
 
 // SAFETY: devices are created with implicit device synchronization.
@@ -122,6 +126,7 @@ impl DeviceState {
     /// host reports it at once too (once is all the guest hears), so a guest
     /// waiting on the lost future does not depend on Dawn's timing.
     pub(crate) fn destroy(&self) {
+        let _copies = exclusive(&self.access);
         // SAFETY: a live device.
         unsafe { ffi::wgpuDeviceDestroy(self.raw) };
         self.link.on_lost(
@@ -193,6 +198,18 @@ impl Host {
             )));
         }
 
+        // Only webgpu.h's features: Dawn has more, which a guest never hears
+        // of and may not ask for.
+        if let Some(feature) = descriptor.and_then(|descriptor| {
+            descriptor
+                .required_features
+                .iter()
+                .find(|&&feature| FeatureName::from_u32(feature).is_none())
+        }) {
+            return Err(early(&format!(
+                "Required feature {feature:#x} is not supported."
+            )));
+        }
         let mut l = Lowering::new(self, Some(&adapter_object));
         let mut native = match descriptor {
             // SAFETY: just lowered, owned by `l`.
@@ -278,6 +295,7 @@ impl Host {
             link,
             adapter_info: adapter_state.info.clone(),
             queue_handle: Mutex::new(0),
+            access: RwLock::new(()),
         });
         self.register_device(&state);
         Ok(state)
@@ -333,8 +351,9 @@ impl Host {
             return 0;
         };
         let mut queue_handle = lock(&state.queue_handle);
-        if *queue_handle != 0 && self.object(*queue_handle, Kind::Queue).is_some() {
-            self.add_ref_handle(*queue_handle, Kind::Queue);
+        // One table operation: a release on another thread cannot slip in
+        // between finding the handle live and adding the reference.
+        if *queue_handle != 0 && self.add_ref_handle(*queue_handle, Kind::Queue) {
             return *queue_handle;
         }
         // SAFETY: the handle's own reference to the live queue.

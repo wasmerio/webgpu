@@ -26,13 +26,28 @@ fn size_t_sentinels_survive_the_trip_from_32_to_64_bits() {
 #[test]
 fn texture_accounting_counts_blocks_layers_samples_and_mips() {
     // The budget conformance program's 256x256 RGBA8 texture: 256 KiB.
-    assert_eq!(texture_bytes(TextureFormat::RGBA8Unorm, 256, 256, 1, 1, 1), 256 << 10);
+    assert_eq!(
+        texture_bytes(TextureFormat::RGBA8Unorm, 256, 256, 1, 1, 1),
+        256 << 10
+    );
     // Compressed formats count 4x4 blocks.
-    assert_eq!(texture_bytes(TextureFormat::BC1RGBAUnorm, 8, 8, 1, 1, 1), 4 * 8);
-    assert_eq!(texture_bytes(TextureFormat::BC1RGBAUnorm, 5, 5, 1, 1, 1), 4 * 8);
+    assert_eq!(
+        texture_bytes(TextureFormat::BC1RGBAUnorm, 8, 8, 1, 1, 1),
+        4 * 8
+    );
+    assert_eq!(
+        texture_bytes(TextureFormat::BC1RGBAUnorm, 5, 5, 1, 1, 1),
+        4 * 8
+    );
     // Layers and samples multiply; a mip chain adds a third.
-    assert_eq!(texture_bytes(TextureFormat::R8Unorm, 4, 4, 2, 1, 4), 4 * 4 * 2 * 4);
-    assert_eq!(texture_bytes(TextureFormat::R32Float, 3, 1, 1, 2, 1), 12 + 4);
+    assert_eq!(
+        texture_bytes(TextureFormat::R8Unorm, 4, 4, 2, 1, 4),
+        4 * 4 * 2 * 4
+    );
+    assert_eq!(
+        texture_bytes(TextureFormat::R32Float, 3, 1, 1, 2, 1),
+        12 + 4
+    );
 }
 
 #[test]
@@ -196,5 +211,55 @@ fn a_late_map_callback_does_not_undo_an_unmap() {
     // A current one does map.
     map.lock().unwrap().state = BufferMapState::Pending;
     super::callbacks::settle_map(&map, 2, true);
+    assert_eq!(map.lock().unwrap().state, BufferMapState::Mapped);
+}
+
+#[test]
+fn a_future_dawn_completes_inside_the_call_leaves_nothing_behind() {
+    use super::callbacks::{self, Futures, Pending, Simple};
+    let host = host();
+    let futures = Futures::default();
+    let pending = |future| Pending::new(&host.events, &futures, future);
+    // The callback runs before the call that started the future returns...
+    let early = callbacks::userdata(Simple {
+        pending: pending(7),
+        kind: crate::abi::EVENT_QUEUE_WORK_DONE,
+    });
+    // SAFETY: a context boxed for this callback, and a view of a string.
+    unsafe { callbacks::status_message(1, super::view(""), early, std::ptr::null_mut()) };
+    futures.track(7, ffi::WGPUFuture { id: 70 });
+    assert_eq!(
+        futures.len_for_test(),
+        0,
+        "nothing to wait for, nothing kept"
+    );
+    assert!(futures.dawn_ids(&[7]).is_empty());
+    // ...or after, as usual: tracked, then forgotten.
+    let late = callbacks::userdata(Simple {
+        pending: pending(8),
+        kind: crate::abi::EVENT_QUEUE_WORK_DONE,
+    });
+    futures.track(8, ffi::WGPUFuture { id: 80 });
+    assert_eq!(futures.dawn_ids(&[8]), [80]);
+    // SAFETY: as above.
+    unsafe { callbacks::status_message(1, super::view(""), late, std::ptr::null_mut()) };
+    assert_eq!(futures.len_for_test(), 0);
+    assert!(host.events.is_ready(&[7]) && host.events.is_ready(&[8]));
+}
+
+#[test]
+fn a_refused_map_request_does_not_settle_the_pending_one() {
+    let map = Arc::new(Mutex::new(MapInfo {
+        state: BufferMapState::Pending,
+        mode: map_mode::READ,
+        offset: 0,
+        size: 4,
+        generation: 3,
+    }));
+    // A second request while one is pending: Dawn fails it at once.
+    super::callbacks::settle_map(&map, super::buffer::REFUSED_MAP, false);
+    assert_eq!(map.lock().unwrap().state, BufferMapState::Pending);
+    // The first one's callback still maps the buffer.
+    super::callbacks::settle_map(&map, 3, true);
     assert_eq!(map.lock().unwrap().state, BufferMapState::Mapped);
 }

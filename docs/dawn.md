@@ -49,14 +49,16 @@ Most of the host is generated from `spec/webgpu.json` by
 | File | What |
 | --- | --- |
 | `src/dawn/ffi.gen.rs` | The native C API: objects, enums, structs, callbacks, functions |
-| `src/dawn/layout_check.gen.c` | Every native struct's size and offsets, as C static assertions |
+| `src/dawn/layout_check.gen.c` | The same struct layouts, every enum value and every function prototype, as C static assertions |
 | `src/dawn/lower.gen.rs` | Decoded guest structs to native ones, and the few native structs written back |
 | `src/dawn/forward.gen.rs` | Every import: a forward, or a call to the hand-written `manual_*` method |
 
-The layouts are proved twice: `ffi.gen.rs` asserts at compile time what the
-generator computed for a 64-bit target, and `build.rs` compiles
-`layout_check.gen.c` against the headers of the Dawn being linked. If both
-hold, the Rust bindings and Dawn agree.
+What the bindings assume is checked against the Dawn being linked:
+`ffi.gen.rs` asserts at compile time the struct layouts the generator
+computed for a 64-bit target, and `build.rs` compiles `layout_check.gen.c`,
+which asserts those layouts, every enum and bitflag value, and every
+function's prototype, against that Dawn's headers. A Dawn whose `webgpu.h`
+differs from `spec/` fails the build instead of linking.
 
 A forward looks the receiver up, lowers the arguments, calls Dawn and
 registers what it returns. Lowering is where the guest is kept honest:
