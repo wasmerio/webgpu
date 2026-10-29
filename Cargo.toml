@@ -5,7 +5,7 @@ description = "WebGPU (webgpu.h) for WASIX guests running on the Wasmer WebAssem
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wasmerio/webgpu"
-exclude = ["tests/programs/out", "tests/browser/node_modules", "examples/out", "lib", "dist"]
+exclude = ["tests/programs/out", "tests/browser/node_modules", "tests/browser/out", "examples/out", "lib", "dist"]
 
 [features]
 default = []
@@ -86,6 +86,14 @@ required-features = ["cli"]
 name = "embedder_tests"
 path = "tests/embedder_tests.rs"
 required-features = ["cli"]
+
+# The runtime hooks in a browser: built for wasm32-unknown-unknown by
+# tests/browser/build-runtime-hooks.sh, and run by tests/browser/run.mjs.
+[[example]]
+name = "runtime_hooks"
+path = "tests/browser/runtime_hooks.rs"
+crate-type = ["cdylib"]
+required-features = ["js"]
 
 # This repository builds on its own. When the crate is consumed by path from
 # another workspace (the Wasmer SDK, or `wasmer/lib/webgpu`), that workspace's

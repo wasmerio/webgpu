@@ -182,7 +182,7 @@ browser cannot do.
 
 ```sh
 make test           # native: unit tests, ABI sweep, conformance programs, embedder tests
-make test-browser   # the same programs in the installed Chrome
+make test-browser   # the same programs in the installed Chrome, and the runtime hooks built for it
 make check          # generated files up to date, formatting, lints, wasm32 build
 ```
 

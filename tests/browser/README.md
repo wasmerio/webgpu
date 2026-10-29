@@ -6,14 +6,15 @@ binaries run on the native host through `tests/manifest_tests.rs`; a program
 passes when it prints exactly what `tests/manifest.json` says, on both.
 
 The harness is standalone: it does not use the Wasmer SDK. That keeps a
-failure here about the host and nothing else.
+failure here about the host and nothing else. Only `runtime_hooks` goes
+through the crate's Rust side, as the SDK does.
 
 ## Running
 
 ```sh
 cd tests/browser
 npm install            # once: playwright-core, which downloads no browser
-node run.mjs           # builds the programs, then runs everything
+node run.mjs           # builds the programs and the fixture, then runs everything
 ```
 
 `run.mjs` exits non-zero if anything fails and prints one line per test.
@@ -24,9 +25,9 @@ node run.mjs [name...] [--headed] [--no-build] [--verbose] [--repeat <n>] [--tim
 
 | | |
 |---|---|
-| `name...` | Run only these tests (program names, `embedder_*` names, `abi_sweep`, `host_tests`). |
+| `name...` | Run only these tests (program names, `embedder_*` names, `abi_sweep`, `host_tests`, `runtime_hooks`). |
 | `WEBGPU_TEST_FILTER=<substring>` | Run the tests whose name contains it, as for the native tests. |
-| `--no-build` | Do not run `tests/build-test-wasix.sh` first. |
+| `--no-build` | Do not run `tests/build-test-wasix.sh` and `build-runtime-hooks.sh` first. |
 | `WEBGPU_TEST_OUT_DIR=<dir>` | Where the programs are built and served from (the build script's own variable). |
 | `--verbose` | Also print what each program wrote and what the host logged. |
 | `--repeat <n>` | Run each program `n` times. Anything that depends on timing only shows this way. |
@@ -39,6 +40,10 @@ node run.mjs [name...] [--headed] [--no-build] [--verbose] [--repeat <n>] [--tim
 
 - **Node.js** 20 or later, and `wasixcc` to build the programs (not needed
   with `--no-build`).
+- For `runtime_hooks`, Rust's `wasm32-unknown-unknown` target and the
+  `wasm-bindgen` CLI of the version in `Cargo.lock`
+  (`cargo install wasm-bindgen-cli --locked --version <version>`;
+  `WASM_BINDGEN` names another binary).
 - **Google Chrome**, installed normally. Playwright drives it through
   `channel: 'chrome'`; nothing is downloaded, and a Chrome that is already
   open is left alone (the tests run in a fresh profile of their own).
@@ -104,6 +109,13 @@ Cross-Origin-Embedder-Policy: require-corp
    values of `webgpu.h`, strings with an explicit length, extension structs
    that do not belong), how event records are handed over, timeouts, and a
    memory that grows.
+5. **`runtime_hooks`**: the crate's browser backend, built with wasm-bindgen,
+   instantiating small guests through `WebGpuRuntimeHooks` in a worker. It
+   covers what the backend adds to the host for an embedder: the
+   `event_waker` of the context, woken by an event a call makes ready and by
+   one the browser settles; `__wasmerWebGpuHostCreated`, called once the
+   guest's memory is bound, never for an instance that failed, and failing
+   the instance when it throws; and every host disposed of with its store.
 
 ## How a program runs
 
@@ -114,6 +126,7 @@ Cross-Origin-Embedder-Policy: require-corp
 | `worker.js` | The guest's worker: creates the shared `WebAssembly.Memory` the module asks for, the WASIX stub and the WebGPU host, wraps the imports flagged `suspending` in `WebAssembly.Suspending`, and calls `WebAssembly.promising(_start)`. On request it starts a second program afterwards, with a host of its own. |
 | `wasix_stub.js` | The WASI and WASIX imports a single-threaded C program needs to print and exit. Anything else a program imports throws when called. |
 | `sweep.js`, `host_tests.js` | The tests that need no program. |
+| `runtime_hooks.rs` | The `runtime_hooks` tests, built by `build-runtime-hooks.sh` into `out/` (a Cargo example of the crate). `runtime_hooks.js` runs them in a worker (`runtime_hooks_worker.js`). |
 
 Every surface of a program presents to one canvas of 640 by 480, the size of
 the native runner's default target. On the page it is a real `<canvas>`,

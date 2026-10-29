@@ -6,12 +6,13 @@
 //  - the same programs under the options an embedder sets: limits, a kill
 //    switch, its own surface target (tests/embedder_tests.rs);
 //  - every import called with null and garbage arguments (tests/abi_sweep.rs);
-//  - the host's imports called by hand, to see what the browser is asked for.
+//  - the host's imports called by hand, to see what the browser is asked for;
+//  - the crate's runtime hooks, built with wasm-bindgen, as an embedder uses them.
 //
 //     node tests/browser/run.mjs [name...] [--headed] [--no-build] [--verbose] [--repeat <n>]
 //                                [--timeout <seconds>] [--serve]
 //
-// Names select tests of any of the four groups. `WEBGPU_TEST_FILTER=<substring>`
+// Names select tests of any of the five groups. `WEBGPU_TEST_FILTER=<substring>`
 // does too, as for the native tests. `WEBGPU_CHROME_ARGS` adds command-line
 // switches to Chrome. See README.md for what this needs.
 
@@ -90,6 +91,11 @@ function serveRepository() {
 function buildPrograms() {
   const build = spawnSync(join(ROOT, 'tests/build-test-wasix.sh'), { stdio: 'inherit' });
   if (build.status !== 0) throw new Error('tests/build-test-wasix.sh failed (is wasixcc installed?)');
+}
+
+function buildRuntimeHooks() {
+  const build = spawnSync(join(ROOT, 'tests/browser/build-runtime-hooks.sh'), { stdio: 'inherit' });
+  if (build.status !== 0) throw new Error('tests/browser/build-runtime-hooks.sh failed (see README.md)');
 }
 
 async function launchChrome(headed) {
@@ -289,6 +295,7 @@ const EMBEDDER_TESTS = [
 
 const SWEEP_TEST = 'abi_sweep';
 const HOST_TESTS = 'host_tests';
+const RUNTIME_HOOKS = 'runtime_hooks';
 
 function report(name, expected, outcome, failure) {
   const block = (title, text) => `--- ${title} ---\n${text}${text.endsWith('\n') ? '' : '\n'}`;
@@ -322,9 +329,11 @@ async function main() {
     const embedderTests = repeated(EMBEDDER_TESTS.filter(selected));
     const sweep = selected({ name: SWEEP_TEST });
     const hostTests = selected({ name: HOST_TESTS });
-    if (programs.length + embedderTests.length + Number(sweep) + Number(hostTests) === 0) {
+    const runtimeHooks = selected({ name: RUNTIME_HOOKS });
+    if (programs.length + embedderTests.length + Number(sweep) + Number(hostTests) + Number(runtimeHooks) === 0) {
       throw new Error('no test matched');
     }
+    if (options.build && runtimeHooks) buildRuntimeHooks();
 
     browser = await launchChrome(options.headed);
     const page = await browser.newPage();
@@ -390,6 +399,13 @@ async function main() {
       for (const { name, failure, milliseconds } of await page.evaluate(() => window.runHostTests())) {
         result(HOST_TESTS, name, milliseconds, failure);
         if (failure !== null) failures.push(`${HOST_TESTS}: ${name}\n${failure}\n`);
+      }
+    }
+
+    if (runtimeHooks) {
+      for (const { name, failure, milliseconds } of await page.evaluate(() => window.runRuntimeHookTests())) {
+        result(RUNTIME_HOOKS, name, milliseconds, failure);
+        if (failure !== null) failures.push(`${RUNTIME_HOOKS}: ${name}\n${failure}\n`);
       }
     }
 
