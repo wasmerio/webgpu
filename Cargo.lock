@@ -5785,7 +5785,9 @@ name = "wasmer-webgpu"
 version = "0.705.0"
 dependencies = [
  "anyhow",
+ "cc",
  "js-sys",
+ "objc2 0.6.5",
  "pollster",
  "raw-window-handle",
  "serde",

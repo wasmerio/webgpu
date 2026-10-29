@@ -260,6 +260,30 @@ mod native {
                 .map_err(|_| self.fault(ptr, out.len() as u64))
         }
 
+        /// Runs `f` with the host address of the `len` bytes at `ptr`, for a
+        /// GPU library call that copies to or from them before it returns (an
+        /// upload, a mapped-range copy): one copy instead of two. The address
+        /// must not be kept past `f`. Other guest threads may change the bytes
+        /// meanwhile, as they may during any copy, so only plain bytes travel
+        /// this way, never anything the host decodes.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg_attr(not(feature = "dawn"), allow(dead_code))]
+        pub(crate) fn with_host_bytes<R>(
+            &self,
+            ptr: u32,
+            len: u64,
+            f: impl FnOnce(*mut u8) -> R,
+        ) -> AbiResult<R> {
+            let end = u64::from(ptr).checked_add(len);
+            if end.is_none_or(|end| end > self.size()) {
+                return Err(self.fault(ptr, len));
+            }
+            // In bounds. A memory only grows, and a shared one (the only kind
+            // another thread can grow during this call) never moves.
+            // SAFETY: `ptr` is within the memory.
+            Ok(f(unsafe { self.view.data_ptr().add(ptr as usize) }))
+        }
+
         pub fn read_bytes<const N: usize>(&self, ptr: u32) -> AbiResult<[u8; N]> {
             let mut out = [0u8; N];
             self.read_into(ptr, &mut out)?;

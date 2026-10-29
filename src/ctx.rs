@@ -134,7 +134,7 @@ impl WebGpuCtxBuilder {
                     .surfaces
                     .unwrap_or_else(|| Arc::new(crate::surface::HeadlessSurfaces::default())),
                 #[cfg(not(target_arch = "wasm32"))]
-                hosts: Mutex::new(crate::host::HostRegistry::default()),
+                hosts: Mutex::new(crate::native::HostRegistry::default()),
                 event_waker: self.event_waker,
                 #[cfg(target_arch = "wasm32")]
                 canvas_scope: self.canvas_scope,
@@ -151,7 +151,7 @@ pub(crate) struct CtxInner {
     pub(crate) surfaces: Arc<dyn crate::surface::SurfaceProvider>,
     /// Host state of every live guest process started through this context.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) hosts: Mutex<crate::host::HostRegistry>,
+    pub(crate) hosts: Mutex<crate::native::HostRegistry>,
     #[cfg_attr(all(target_arch = "wasm32", not(feature = "js")), allow(dead_code))]
     pub(crate) event_waker: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(target_arch = "wasm32")]

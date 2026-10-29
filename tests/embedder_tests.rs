@@ -85,19 +85,33 @@ fn a_frame_sink_is_told_how_the_guest_means_its_colours() {
     assert_eq!(frame.tone_mapping, FrameToneMapping::Extended);
 }
 
-/// `wgpuCommandEncoderWriteTimestamp` goes through wherever the adapter can
-/// write a timestamp from an encoder, and is a validation error elsewhere.
-#[test]
-fn encoder_timestamps_are_written_where_the_adapter_can() {
+/// Whether the native host's backend writes a timestamp from an encoder.
+/// wgpu does wherever the adapter can.
+#[cfg(not(feature = "dawn"))]
+fn encoder_timestamps_written() -> bool {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         force_fallback_adapter: std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER").is_some(),
         ..Default::default()
     }))
     .expect("an adapter for the tests");
-    let able = adapter.features().contains(
-        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
-    );
+    adapter
+        .features()
+        .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+}
+
+/// Dawn never does for a guest: it keeps them behind its unsafe APIs, as a
+/// browser does, since the WebGPU specification dropped them.
+#[cfg(feature = "dawn")]
+fn encoder_timestamps_written() -> bool {
+    false
+}
+
+/// `wgpuCommandEncoderWriteTimestamp` goes through wherever the backend
+/// writes a timestamp from an encoder, and is a validation error elsewhere.
+#[test]
+fn encoder_timestamps_are_written_where_the_backend_can() {
+    let able = encoder_timestamps_written();
 
     let output = run(&builder().build(), "timestamps");
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);

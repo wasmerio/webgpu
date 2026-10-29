@@ -15,12 +15,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import emit_c  # noqa: E402
 import emit_js  # noqa: E402
+import emit_native  # noqa: E402
 import emit_rust  # noqa: E402
 from spec import ROOT, Spec  # noqa: E402
 
 
 def outputs(spec):
-    return {
+    files = {
         "include/webgpu/webgpu_wasix.h": emit_c.emit_extension_header(spec),
         "guest/src/wgpu_imports.gen.h": emit_c.emit_imports_header(spec),
         "guest/src/wgpu_forwarders.gen.c": emit_c.emit_forwarders(spec),
@@ -33,6 +34,12 @@ def outputs(spec):
         "src/abi/imports.gen.rs": emit_rust.emit_imports(spec),
         "js/webgpu_abi.gen.js": emit_js.emit_abi(spec),
     }
+    ffi, layouts = emit_native.emit_ffi(spec)
+    files["src/dawn/ffi.gen.rs"] = ffi
+    files["src/dawn/layout_check.gen.c"] = emit_native.emit_layout_check(spec, layouts)
+    files["src/dawn/lower.gen.rs"] = emit_native.emit_lower(spec)
+    files["src/dawn/forward.gen.rs"] = emit_native.emit_forward(spec)[0]
+    return files
 
 
 def main():

@@ -29,7 +29,7 @@ pub(crate) const RECORD_HEADER_SIZE: usize = 32;
 /// u8  message[message_len], padded to 8 bytes
 /// u8  extra[extra_len], padded to 8 bytes
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Record {
     pub future: u64,
     pub kind: u32,
@@ -38,11 +38,26 @@ pub(crate) struct Record {
     pub aux: u32,
     pub message: String,
     pub extra: Vec<u8>,
-    // Host-only, absent from the wire format: the compiler lane admission an
-    // async pipeline's event holds until the guest collects it (only its Drop
-    // matters), and the instance whose release retires the event.
-    pub(super) _pipeline_slot: Option<Arc<super::pipeline_worker::Slot>>,
-    pub(super) pipeline_instance: u32,
+    // Host-only, absent from the wire format: whatever the event keeps alive
+    // until the guest collects it (an async pipeline's compiler lane
+    // admission; only its Drop matters), and the instance whose release
+    // retires the event.
+    pub(crate) _keep_alive: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    pub(crate) pipeline_instance: u32,
+}
+
+impl std::fmt::Debug for Record {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Record")
+            .field("future", &self.future)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("handle", &self.handle)
+            .field("aux", &self.aux)
+            .field("message", &self.message)
+            .field("extra", &self.extra.len())
+            .finish()
+    }
 }
 
 fn pad8(len: usize) -> usize {
@@ -178,7 +193,8 @@ impl Events {
     }
 
     #[cfg(test)]
-    pub(super) fn take_for_test(&self) -> Vec<Record> {
+    #[cfg_attr(feature = "dawn", allow(dead_code))]
+    pub(crate) fn take_for_test(&self) -> Vec<Record> {
         self.lock().drain(..).collect()
     }
 

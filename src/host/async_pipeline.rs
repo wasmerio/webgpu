@@ -188,7 +188,7 @@ impl Host {
             status: status.as_u32(),
             handle,
             message,
-            _pipeline_slot: slot,
+            _keep_alive: slot.map(|slot| slot as Arc<dyn std::any::Any + Send + Sync>),
             pipeline_instance: request.instance,
             ..Record::default()
         });
