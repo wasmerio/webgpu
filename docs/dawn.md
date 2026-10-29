@@ -80,9 +80,11 @@ registers what it returns. Lowering is where the guest is kept honest:
   polls drives Dawn with `wgpuInstanceProcessEvents`; one that waits blocks
   inside `wgpuInstanceWaitAny` on the Dawn futures behind the ones it named.
   Adapter and device requests complete before the import returns.
-- **Guest memory.** Mapped ranges, uploads and immediate data go between Dawn
-  and guest memory in one copy, through `GuestMemory::with_host_bytes`, which
-  hands Dawn the address only for the duration of the call.
+- **Guest memory.** Dawn never touches guest memory, which other guest
+  threads may be writing: every copy to or from it is Wasmer's, which allows
+  that. Mapped ranges go between Dawn's mapping and guest memory in that one
+  copy; uploads and immediate data reach Dawn as a host copy
+  (`GuestMemory::with_copy`, through a buffer each thread keeps).
 - **Policy.** The GPU memory budget, the device and object limits, stable
   queue handles, and termination.
 - **Surfaces.** A headless target is a swap chain the host runs itself; a
@@ -106,6 +108,11 @@ ABI:
 - `WGPU_WHOLE_SIZE` as the size of `wgpuCommandEncoderCopyBufferToBuffer`
   means the rest of the source, as in the browser host, although Dawn's C
   API takes only real sizes.
+- `WebGpuCtxBuilder::force_fallback_adapter` (`WEBGPU_TEST_FALLBACK_ADAPTER`
+  for the tests) asks Dawn for its fallback adapter, and Dawn has one only
+  with SwiftShader, which this build leaves out: Mesa's lavapipe or WARP are
+  ordinary adapters to it. Where the software one is the only adapter (a CI
+  runner), leave the option off; Dawn picks it anyway.
 
 [Dawn]: https://dawn.googlesource.com/dawn
 [wgpu]: https://github.com/gfx-rs/wgpu

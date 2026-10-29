@@ -192,7 +192,9 @@ make check          # generated files up to date, formatting, lints, wasm32 buil
 `tests/manifest.json` records what each conformance program must print; the
 same binaries run on both hosts. The native run also fails if any function of
 `webgpu.h` is used by no program. Machines without a GPU can run the native
-suite on a software adapter with `WEBGPU_TEST_FALLBACK_ADAPTER=1`.
+suite on a software adapter with `WEBGPU_TEST_FALLBACK_ADAPTER=1` (the wgpu
+host; Dawn picks the software adapter by itself when it is the only one, see
+[docs/dawn.md](docs/dawn.md)).
 
 ## Integrating
 

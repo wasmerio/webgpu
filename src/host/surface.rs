@@ -72,9 +72,33 @@ struct SurfaceInner {
     presented: u64,
 }
 
+impl SurfaceInner {
+    /// Ends the configuration, for Unconfigure or a Configure replacing it.
+    /// A frame acquired and not presented is destroyed, as the surface
+    /// contract says: the guest may still hold its texture, and must not be
+    /// able to go on using it. A window's frame goes back to wgpu, which
+    /// discards it.
+    fn retire(&mut self) {
+        if let Some(CurrentFrame::Headless(frame)) = self.frame.take() {
+            frame.texture.destroy();
+        }
+        self.configured = None;
+    }
+}
+
 pub(crate) struct SurfaceState {
     backing: Backing,
     inner: Mutex<SurfaceInner>,
+}
+
+impl Drop for SurfaceState {
+    fn drop(&mut self) {
+        // As a browser's canvas does when it goes.
+        self.inner
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retire();
+    }
 }
 
 impl SurfaceState {
@@ -392,8 +416,7 @@ impl SurfaceApi for Host {
 
         let mut inner = lock(&state.inner);
         // Reconfiguring first unconfigures: the current frame is gone.
-        inner.frame = None;
-        inner.configured = None;
+        inner.retire();
         match &state.backing {
             Backing::Window { surface, .. } => {
                 // The backend presents a window in sRGB and has no way to
@@ -582,9 +605,7 @@ impl SurfaceApi for Host {
 
     fn surface_unconfigure(&self, _cx: &mut Cx<'_>, surface: Handle) {
         if let Some(state) = self.surface(surface) {
-            let mut inner = lock(&state.inner);
-            inner.frame = None;
-            inner.configured = None;
+            lock(&state.inner).retire();
         }
     }
 

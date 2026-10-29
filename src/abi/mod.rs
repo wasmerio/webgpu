@@ -260,28 +260,55 @@ mod native {
                 .map_err(|_| self.fault(ptr, out.len() as u64))
         }
 
-        /// Runs `f` with the host address of the `len` bytes at `ptr`, for a
-        /// GPU library call that copies to or from them before it returns (an
-        /// upload, a mapped-range copy): one copy instead of two. The address
-        /// must not be kept past `f`. Other guest threads may change the bytes
-        /// meanwhile, as they may during any copy, so only plain bytes travel
-        /// this way, never anything the host decodes.
-        #[cfg(not(target_arch = "wasm32"))]
+        /// Runs `f` on a copy of the `len` guest bytes at `ptr`, for a GPU
+        /// library call that copies them again before it returns (an upload).
+        ///
+        /// Other guest threads may write the bytes meanwhile, so the library
+        /// never reads guest memory itself: Wasmer's copy is the one that
+        /// tolerates concurrent writes. A guest racing its own upload gets some
+        /// mix of old and new bytes, a data race of the guest's, never
+        /// undefined behaviour in the host. The copy goes through a buffer
+        /// each thread keeps, so steady uploads don't allocate.
         #[cfg_attr(not(feature = "dawn"), allow(dead_code))]
-        pub(crate) fn with_host_bytes<R>(
+        pub(crate) fn with_copy<R>(
             &self,
             ptr: u32,
             len: u64,
-            f: impl FnOnce(*mut u8) -> R,
+            f: impl FnOnce(&[u8]) -> R,
         ) -> AbiResult<R> {
+            /// Capacity a thread's buffer keeps between copies. A bigger copy
+            /// gets a buffer of its own, freed after it.
+            const KEEP: usize = 4 << 20;
+            thread_local! {
+                static SCRATCH: std::cell::Cell<Vec<u8>> =
+                    const { std::cell::Cell::new(Vec::new()) };
+            }
             let end = u64::from(ptr).checked_add(len);
             if end.is_none_or(|end| end > self.size()) {
                 return Err(self.fault(ptr, len));
             }
-            // In bounds. A memory only grows, and a shared one (the only kind
-            // another thread can grow during this call) never moves.
-            // SAFETY: `ptr` is within the memory.
-            Ok(f(unsafe { self.view.data_ptr().add(ptr as usize) }))
+            // In bounds, so it fits.
+            let count = len as usize;
+            // Taken, not borrowed: a copy nested in `f` gets its own buffer.
+            // A copy too big to keep leaves the thread's buffer where it is.
+            let mut scratch = if count <= KEEP {
+                SCRATCH.take()
+            } else {
+                Vec::new()
+            };
+            scratch.clear();
+            scratch.reserve_exact(count);
+            let result = match self
+                .view
+                .read_uninit(u64::from(ptr), &mut scratch.spare_capacity_mut()[..count])
+            {
+                Ok(bytes) => Ok(f(bytes)),
+                Err(_) => Err(self.fault(ptr, len)),
+            };
+            if count <= KEEP {
+                SCRATCH.set(scratch);
+            }
+            result
         }
 
         pub fn read_bytes<const N: usize>(&self, ptr: u32) -> AbiResult<[u8; N]> {

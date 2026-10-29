@@ -55,6 +55,10 @@
       "stdout": "capabilities: ok\nunconfigured: no current texture\npresented 3 frames\nunconfigured again: no current texture\nsurface made again for the same target\nok\n"
     },
     {
+      "name": "surface_reconfigure",
+      "stdout": "a frame held past Unconfigure: destroyed\na frame held past Configure: destroyed\nred from the first device: drawn, presented\ngreen from the second device: drawn, presented\nok\n"
+    },
+    {
       "name": "labels_refs",
       "stdout": "labels: ok\nreferences: ok\nexternal texture: nothing to create\nok\n"
     },

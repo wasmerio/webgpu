@@ -331,14 +331,14 @@ pub(crate) fn exclusive(lock: &RwLock<()>) -> RwLockWriteGuard<'_, ()> {
 
 /// Counts `bytes` against the guest's GPU memory, saturating.
 pub(crate) fn charge(counter: &AtomicU64, bytes: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
         Some(used.saturating_add(bytes))
     });
 }
 
 /// Gives `bytes` back, saturating.
 pub(crate) fn refund(counter: &AtomicU64, bytes: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
         Some(used.saturating_sub(bytes))
     });
 }

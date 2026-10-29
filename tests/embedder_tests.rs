@@ -85,6 +85,40 @@ fn a_frame_sink_is_told_how_the_guest_means_its_colours() {
     assert_eq!(frame.tone_mapping, FrameToneMapping::Extended);
 }
 
+#[test]
+fn a_surface_moved_to_another_device_presents_what_that_device_drew() {
+    let sink = CaptureFrames::new(4, 4);
+    let ctx = builder()
+        .surface_provider(Arc::new(SingleSurface(SurfaceTarget::Headless(
+            sink.clone(),
+        ))))
+        .build();
+    // Presents red from one device, then green from another at the same size.
+    let output = run(&ctx, "surface_reconfigure");
+    assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert!(
+        output
+            .stdout
+            .contains("green from the second device: drawn, presented\n"),
+        "{}",
+        output.stdout
+    );
+    // Read back through the second device, not through what the host kept
+    // from the first.
+    let frame = sink.last_frame().expect("a frame was presented");
+    assert_eq!((frame.index, frame.width, frame.height), (1, 4, 4));
+    assert!(
+        frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == [0, 255, 0, 255]),
+        "the last frame is solid green: {:?}",
+        frame.pixels
+    );
+}
+
 /// Whether the native host's backend writes a timestamp from an encoder.
 /// wgpu does wherever the adapter can.
 #[cfg(not(feature = "dawn"))]

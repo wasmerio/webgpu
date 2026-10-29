@@ -1,6 +1,7 @@
 //! `WGPUQueue` uploads, and immediate data of passes and bundles: calls whose
-//! data is a pointer into guest memory. Dawn copies the bytes before the call
-//! returns, straight from guest memory.
+//! data is a pointer into guest memory. Dawn gets a host copy of the bytes
+//! (see `GuestMemory::with_copy`), which it copies again before the call
+//! returns.
 
 use std::sync::Arc;
 
@@ -32,14 +33,14 @@ impl Host {
         };
         let size = usize_from_guest(size);
         // A wild guest pointer traps the guest; a bad call is Dawn's to report.
-        let _ = cx.mem.with_host_bytes(data, size as u64, |bytes| {
-            // SAFETY: live objects; `size` in-bounds bytes Dawn copies now.
+        let _ = cx.mem.with_copy(data, size as u64, |bytes| {
+            // SAFETY: live objects; `size` host bytes Dawn copies now.
             unsafe {
                 ffi::wgpuQueueWriteBuffer(
                     this.raw.cast(),
                     target.cast(),
                     buffer_offset,
-                    bytes.cast_const().cast(),
+                    bytes.as_ptr().cast(),
                     size,
                 )
             }
@@ -73,14 +74,14 @@ impl Host {
             Err(error) => return l.fail("wgpuQueueWriteTexture", error),
         };
         let size = usize_from_guest(data_size);
-        let _ = cx.mem.with_host_bytes(data, size as u64, |bytes| {
+        let _ = cx.mem.with_copy(data, size as u64, |bytes| {
             // SAFETY: live objects, native structs owned by `l`, and `size`
-            // in-bounds bytes Dawn copies now.
+            // host bytes Dawn copies now.
             unsafe {
                 ffi::wgpuQueueWriteTexture(
                     this.raw.cast(),
                     destination,
-                    bytes.cast_const().cast(),
+                    bytes.as_ptr().cast(),
                     size,
                     layout,
                     extent,
@@ -130,8 +131,8 @@ impl Host {
             return;
         };
         let size = usize_from_guest(size);
-        let _ = cx.mem.with_host_bytes(data, size as u64, |bytes| {
-            call(&this, offset, bytes.cast_const().cast(), size)
+        let _ = cx.mem.with_copy(data, size as u64, |bytes| {
+            call(&this, offset, bytes.as_ptr().cast(), size)
         });
     }
 

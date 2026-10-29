@@ -53,8 +53,34 @@ struct SurfaceInner {
     /// The frame handed out and not presented yet.
     frame: Option<Arc<Native>>,
     presented: u64,
-    /// Kept between frames: the buffer headless frames are read back through.
+    /// Kept between frames of one configuration: the buffer headless frames
+    /// are read back through, made on the configured device.
     readback: Option<(u64, ffi::WGPUBuffer)>,
+}
+
+impl SurfaceInner {
+    /// Ends the configuration in the host: for Unconfigure, a Configure
+    /// replacing it, or the surface going.
+    ///
+    /// A frame acquired and not presented is destroyed, as the surface
+    /// contract says: the guest may still hold its texture, and must not be
+    /// able to go on using it. The host is a headless surface's swap chain;
+    /// for a window it does now what Dawn does only later (Dawn's Unconfigure
+    /// parks the swap chain, current texture and all, until the next
+    /// Configure or the surface's release). The readback buffer goes too: it
+    /// belongs to the device configured, and the next configuration may name
+    /// another.
+    fn retire(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            // SAFETY: a live texture: the frame holds a reference to it.
+            unsafe { ffi::wgpuTextureDestroy(frame.raw.cast()) };
+        }
+        self.configured = None;
+        if let Some((_, buffer)) = self.readback.take() {
+            // SAFETY: the surface's own reference.
+            unsafe { ffi::wgpuBufferRelease(buffer) };
+        }
+    }
 }
 
 pub(crate) struct SurfaceState {
@@ -68,15 +94,27 @@ unsafe impl Sync for SurfaceState {}
 
 impl Drop for SurfaceState {
     fn drop(&mut self) {
+        // As a browser's canvas does when it goes, and for the readback
+        // buffer's reference. Not `unconfigure`: the window's Dawn surface
+        // may be released already (its `Native` lets go of it first).
         let inner = self.inner.get_mut().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, buffer)) = inner.readback.take() {
-            // SAFETY: the surface's own reference.
-            unsafe { ffi::wgpuBufferRelease(buffer) };
-        }
+        inner.retire();
     }
 }
 
 impl SurfaceState {
+    /// Ends the configuration, in the host and in Dawn. A window's Dawn
+    /// surface is unconfigured too, before any new configuration: one Dawn
+    /// refuses then leaves no earlier swap chain in place to hand out the
+    /// frame just destroyed. The caller holds the surface's object.
+    fn unconfigure(&self, inner: &mut SurfaceInner) {
+        inner.retire();
+        if let Backing::Window { raw, .. } = &self.backing {
+            // SAFETY: a live surface.
+            unsafe { ffi::wgpuSurfaceUnconfigure(*raw) };
+        }
+    }
+
     fn size(&self) -> (u32, u32) {
         match &self.backing {
             Backing::Window { window, .. } => window.size(),
@@ -426,8 +464,7 @@ impl Host {
 
         let mut inner = lock(&state.inner);
         // Reconfiguring first unconfigures: the current frame is gone.
-        inner.frame = None;
-        inner.configured = None;
+        state.unconfigure(&mut inner);
         match &state.backing {
             Backing::Window { raw, .. } => {
                 // Saying so beats showing the wrong colours.
@@ -635,13 +672,7 @@ impl Host {
         if let Some(object) = self.object(surface, Kind::Surface)
             && let Some(state) = SurfaceState::of(&object)
         {
-            let mut inner = lock(&state.inner);
-            inner.frame = None;
-            inner.configured = None;
-            if let Backing::Window { raw, .. } = &state.backing {
-                // SAFETY: a live surface.
-                unsafe { ffi::wgpuSurfaceUnconfigure(*raw) };
-            }
+            state.unconfigure(&mut lock(&state.inner));
         }
     }
 
@@ -694,7 +725,9 @@ unsafe extern "C" fn on_mapped(
 }
 
 /// Copies a four-bytes-per-pixel frame out of the GPU, rows tightly packed,
-/// through a buffer the surface keeps between frames.
+/// through a buffer the surface keeps between frames of one configuration
+/// (`SurfaceInner::retire` lets it go), so always one of the configured
+/// device's.
 fn read_back(
     host: &Host,
     configured: &Configured,

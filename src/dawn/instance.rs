@@ -156,6 +156,13 @@ impl Host {
         }
         drop(l);
         if request.adapter.is_null() {
+            if self.ctx.force_fallback_adapter {
+                log(|| {
+                    "wgpuInstanceRequestAdapter: the embedder forces a fallback adapter, and \
+                     Dawn's only one is SwiftShader, which this build may not include"
+                        .to_owned()
+                });
+            }
             return Err(if request.message.is_empty() {
                 "No adapter is available.".to_owned()
             } else {

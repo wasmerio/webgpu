@@ -3,7 +3,7 @@
 //! Dawn keeps the map state machine; the host keeps what the shim needs to
 //! know of the current mapping (`wasmer_wgpu_buffer_map_info`) and the
 //! buffer's share of the GPU memory budget. Mapped bytes go between Dawn's
-//! mapping and guest memory in one copy.
+//! mapping and guest memory in one copy, Wasmer's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -36,11 +36,14 @@ pub(crate) struct MapInfo {
 pub(crate) struct BufferState {
     pub(crate) size: u64,
     pub(crate) map: Arc<Mutex<MapInfo>>,
-    /// Held shared while bytes are copied to or from the mapping, and
-    /// exclusively while Dawn unmaps or destroys the buffer: either frees the
-    /// mapping, and Dawn keeps nothing alive for a pointer it handed out.
-    /// (Not `map`: Dawn runs the map callback, which takes that, inside
-    /// Unmap and Destroy.)
+    /// Held shared while bytes are copied out of the mapping, and
+    /// exclusively while they are copied into it (the host never writes
+    /// bytes another thread reads), while Dawn unmaps or destroys the buffer
+    /// (either frees the mapping, and Dawn keeps nothing alive for a pointer
+    /// it handed out), and from a map request's bookkeeping until Dawn has
+    /// the request (so Dawn sees requests, unmaps and destroys in the order
+    /// the bookkeeping does). Not `map`: Dawn runs the map callback, which
+    /// takes that, inside MapAsync, Unmap and Destroy.
     access: RwLock<()>,
     /// Bytes this object still counts for against the guest's budget.
     accounted: AtomicU64,
@@ -218,6 +221,12 @@ impl Host {
         } else {
             size
         };
+        // Held until Dawn has the request: an Unmap, a Destroy or another
+        // request on another thread comes wholly before or wholly after it.
+        // Otherwise an Unmap between the bookkeeping and Dawn's MapAsync
+        // would end a mapping that does not exist yet, leaving the host
+        // saying unmapped about a buffer Dawn then maps.
+        let _requesting = exclusive(&state.access);
         let generation = {
             let mut map = lock(&state.map);
             if map.state == BufferMapState::Unmapped
@@ -279,7 +288,9 @@ impl Host {
     /// Copies between the current mapping and guest memory: into the mapping
     /// for a write, out of it otherwise. The buffer's and its device's access
     /// locks are held throughout, so another guest thread's Unmap or Destroy,
-    /// or the device's destruction, waits until the copy is done.
+    /// or the device's destruction, waits until the copy is done. Guest
+    /// memory may change under the copy (other guest threads run), so
+    /// Wasmer's copy, which allows that, is the one used.
     fn copy_mapped(
         &self,
         cx: &mut Cx<'_>,
@@ -296,7 +307,12 @@ impl Host {
             return Status::Error;
         };
         let _device = object.device.as_ref().map(|device| shared(&device.access));
-        let _buffer = shared(&state.access);
+        // Copies out of a mapping can run side by side; one into it runs alone.
+        let _buffer = if write {
+            (None, Some(exclusive(&state.access)))
+        } else {
+            (Some(shared(&state.access)), None)
+        };
         let Some((start, len, skip)) = state.window(u64::from(offset), u64::from(size), write)
         else {
             return Status::Error;
@@ -317,18 +333,21 @@ impl Host {
         if mapped.is_null() {
             return Status::Error;
         }
-        let copied = cx.mem.with_host_bytes(data, u64::from(size), |guest| {
-            // SAFETY: `size` bytes at `skip` of the mapped range and `size`
-            // in-bounds guest bytes; the two never overlap.
-            unsafe {
-                let mapped = mapped.cast::<u8>().add(skip);
-                if write {
-                    std::ptr::copy_nonoverlapping(guest, mapped, size as usize)
-                } else {
-                    std::ptr::copy_nonoverlapping(mapped, guest, size as usize)
-                }
+        // SAFETY: `size` bytes at `skip` of the mapped range, which the locks
+        // above keep mapped. While the host writes them, no other thread
+        // reads or writes them (the buffer's lock is held exclusively); while
+        // it reads them, none writes them. They are Dawn's memory, never the
+        // guest's.
+        let copied = unsafe {
+            let mapped = mapped.cast::<u8>().add(skip);
+            if write {
+                let mapped = std::slice::from_raw_parts_mut(mapped, size as usize);
+                cx.mem.read_into(data, mapped)
+            } else {
+                let mapped = std::slice::from_raw_parts(mapped.cast_const(), size as usize);
+                cx.mem.write_bytes(data, mapped)
             }
-        });
+        };
         match copied {
             Ok(()) => Status::Success,
             Err(_) => Status::Error,
