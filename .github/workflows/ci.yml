@@ -75,6 +75,66 @@ jobs:
           WEBGPU_TEST_FALLBACK_ADAPTER: ${{ matrix.fallback_adapter }}
         run: ${{ matrix.test }}
 
+  dawn:
+    name: Dawn host (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # As for the wgpu host: Mesa's software Vulkan stands in for a GPU.
+          - os: ubuntu-24.04
+            fallback_adapter: "1"
+            test: make test-dawn
+          # No Metal device on the macOS runners: everything is compiled
+          # (Dawn's Metal backend, the window host), and what needs no
+          # adapter is tested.
+          - os: macos-15
+            fallback_adapter: ""
+            test: >-
+              cargo build --features cli,window,dawn --all-targets &&
+              cargo test --features cli,dawn --lib --test abi_sweep
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dawn
+      - name: Install Dawn's build tools, the window system's files and a software Vulkan driver
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y ninja-build mesa-vulkan-drivers libvulkan1
+          libx11-dev libx11-xcb-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+          libwayland-dev libxkbcommon-dev
+      - name: Install Dawn's build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      # Dawn takes a while to build: keep it for as long as the revision
+      # (pinned in the script) and the header it implements stay the same.
+      - name: Cache Dawn
+        uses: actions/cache@v4
+        with:
+          path: third_party/dawn/install
+          key: dawn-${{ runner.os }}-${{ hashFiles('scripts/build-dawn.sh', 'spec/webgpu.h') }}
+      - name: Build Dawn
+        run: make dawn
+      - name: Lints
+        run: make lint-dawn
+      - name: Install wasixcc
+        uses: wasix-org/wasixcc@v0.4.3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          version: ${{ env.WASIXCC_VERSION }}
+      - name: Build the guest library, the conformance programs and the examples
+        run: make programs examples
+      - name: Test
+        env:
+          WEBGPU_TEST_FALLBACK_ADAPTER: ${{ matrix.fallback_adapter }}
+        run: ${{ matrix.test }}
+
   browser:
     name: Browser host (Chrome)
     runs-on: macos-15

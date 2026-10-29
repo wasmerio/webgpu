@@ -63,7 +63,7 @@ impl BufferState {
     /// wants mapped ranges that start on a multiple of 8 and span a multiple
     /// of 4; the copy calls of the C API have no such rule, so the range is
     /// widened within the mapping.
-    fn window(&self, offset: u64, size: u64, write: bool) -> Option<(u64, u64, usize)> {
+    pub(super) fn window(&self, offset: u64, size: u64, write: bool) -> Option<(u64, u64, usize)> {
         let map = *lock(&self.map);
         if map.state != BufferMapState::Mapped {
             return None;
@@ -80,6 +80,16 @@ impl BufferState {
             .min(map.offset + map.size)
             .max(end);
         Some((start, wide_end - start, (offset - start) as usize))
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(size: u64, map: MapInfo) -> Self {
+        Self {
+            size,
+            map: Arc::new(Mutex::new(map)),
+            accounted: AtomicU64::new(0),
+            gpu_memory: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     fn end_mapping(&self) {

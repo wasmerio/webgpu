@@ -145,16 +145,11 @@ pub(crate) unsafe extern "C" fn buffer_map(
 ) {
     // SAFETY: the context boxed for this callback.
     let map = unsafe { take::<Map>(userdata1) };
-    {
-        let mut info = lock(&map.map);
-        if info.generation == map.generation && info.state == BufferMapState::Pending {
-            info.state = if status == MapAsyncStatus::Success.as_u32() {
-                BufferMapState::Mapped
-            } else {
-                BufferMapState::Unmapped
-            };
-        }
-    }
+    settle_map(
+        &map.map,
+        map.generation,
+        status == MapAsyncStatus::Success.as_u32(),
+    );
     map.pending.finish(Record {
         future: map.pending.future,
         kind: EVENT_BUFFER_MAP,
@@ -163,6 +158,20 @@ pub(crate) unsafe extern "C" fn buffer_map(
         message: unsafe { text(message) },
         ..Record::default()
     });
+}
+
+/// Ends a pending map request: mapped if it succeeded, unmapped otherwise.
+/// Only the buffer's current request may: an unmap or a later request makes
+/// a late callback moot.
+pub(crate) fn settle_map(map: &Mutex<MapInfo>, generation: u64, success: bool) {
+    let mut info = lock(map);
+    if info.generation == generation && info.state == BufferMapState::Pending {
+        info.state = if success {
+            BufferMapState::Mapped
+        } else {
+            BufferMapState::Unmapped
+        };
+    }
 }
 
 // -- shader compilation info ------------------------------------------------

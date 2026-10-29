@@ -8,3 +8,5 @@ node_modules/
 .DS_Store
 __pycache__/
 *.pyc
+# Dawn, for the `dawn` feature (scripts/build-dawn.sh)
+third_party/

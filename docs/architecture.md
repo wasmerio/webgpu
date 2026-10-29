@@ -11,7 +11,8 @@ callbacks, futures, and pointers into mapped GPU memory. A guest calls it
 from inside a 32-bit linear memory; the implementation lives outside, in one
 of two very different hosts:
 
-- natively, Rust code on [wgpu], with real threads and blocking calls;
+- natively, Rust code on [wgpu] (or on Dawn, with the `dawn` feature), with
+  real threads and blocking calls;
 - in a browser, JavaScript on `navigator.gpu`, where every result arrives
   through an event loop that a running guest blocks.
 
@@ -228,9 +229,17 @@ each frame to the page as an `ImageBitmap`.
 (vsync natively, the next animation frame in a browser), which is what paces
 a frame loop.
 
-## The two hosts
+## The hosts
 
-### Native (`src/host/`)
+### Native (`src/host/`, or `src/dawn/`)
+
+What the native hosts share is in `src/native/`: running an import
+(`enter`), the registry of guest processes, the event queue, and the handle
+table. A build has one native host: `src/host/` on wgpu by default,
+`src/dawn/` on Dawn with the `dawn` feature. The Dawn host is mostly
+generated from `spec/webgpu.json`, since Dawn implements the header itself;
+[dawn.md](dawn.md) describes it. The rest of this section is about the wgpu
+host.
 
 One `Host` per guest process, found through the process's linear memory, so
 every thread of a process sees the same handle table. Objects are `Arc`s of

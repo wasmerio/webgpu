@@ -34,6 +34,8 @@ mod lower_gen;
 mod queue;
 mod shim;
 mod surface;
+#[cfg(test)]
+mod tests;
 mod texture;
 
 use std::ffi::c_void;
