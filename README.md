@@ -8,7 +8,7 @@ it:
 
 | Host | GPU backend | Surfaces present to |
 | --- | --- | --- |
-| `wasmer run` and Rust embedders | [wgpu] (Metal, Vulkan, D3D12) | a window, or a headless target |
+| `wasmer run` and Rust embedders | [wgpu] (Metal, Vulkan, D3D12), or [Dawn] with the `dawn` feature | a window, or a headless target |
 | A browser, through the [Wasmer SDK] | the page's `navigator.gpu` | a canvas of the page |
 
 The program is the same binary in every case. It uses the header exactly as
@@ -142,7 +142,8 @@ resize handling and device-loss handling a real one needs.
 ```
 guest (wasm32-wasix)                         host
 +--------------------------+   imports   +--------------------------------+
-| app.c  -> webgpu.h       |  wasmer_    | native: src/host/*.rs on wgpu  |
+| app.c  -> webgpu.h       |  wasmer_    | native: src/host/*.rs on wgpu, |
+|                          |             |   or src/dawn/*.rs on Dawn     |
 | libwebgpu.a              |  webgpu_v0  | browser: js/webgpu_host.js on  |
 |   callbacks, futures,    | ----------> |          navigator.gpu         |
 |   mapped ranges, memory  |             | handles, validation, limits    |
@@ -172,7 +173,8 @@ browser cannot do.
 | `codegen/` | The generator (`python3 codegen/gen.py`, `--check` in CI) |
 | `include/` | What guests compile against: `webgpu/webgpu.h` (unmodified) and `webgpu/webgpu_wasix.h` |
 | `guest/` | Sources of `libwebgpu.a` |
-| `src/` | The `wasmer-webgpu` crate: embedder API, native host, browser glue |
+| `src/` | The `wasmer-webgpu` crate: embedder API, native hosts (`host/` on wgpu, `dawn/` on Dawn, `native/` shared), browser glue |
+| `scripts/` | `build-dawn.sh`: the Dawn the `dawn` feature links |
 | `js/` | The browser host |
 | `examples/` | Programs to start from |
 | `tests/` | Conformance programs with their expected output, run natively and in a browser |
@@ -182,6 +184,7 @@ browser cannot do.
 
 ```sh
 make test           # native: unit tests, ABI sweep, conformance programs, embedder tests
+make test-dawn      # the same on the Dawn host (builds Dawn first, once)
 make test-browser   # the same programs in the installed Chrome, and the runtime hooks built for it
 make check          # generated files up to date, formatting, lints, wasm32 build
 ```
@@ -189,7 +192,9 @@ make check          # generated files up to date, formatting, lints, wasm32 buil
 `tests/manifest.json` records what each conformance program must print; the
 same binaries run on both hosts. The native run also fails if any function of
 `webgpu.h` is used by no program. Machines without a GPU can run the native
-suite on a software adapter with `WEBGPU_TEST_FALLBACK_ADAPTER=1`.
+suite on a software adapter with `WEBGPU_TEST_FALLBACK_ADAPTER=1` (the wgpu
+host; Dawn picks the software adapter by itself when it is the only one, see
+[docs/dawn.md](docs/dawn.md)).
 
 ## Integrating
 
@@ -220,9 +225,9 @@ browser cannot do comes back as its validation error. External textures are
 the exception: neither host provides them yet. A guest's threads cannot share
 GPU objects there, and a guest needs JSPI.
 
-**Natively** the backend is wgpu, which does not implement all of WebGPU.
-Where it cannot do what a program asked, the program gets a validation error
-or an absent feature:
+**Natively** the backend is wgpu by default, which does not implement all of
+WebGPU. Where it cannot do what a program asked, the program gets a
+validation error or an absent feature:
 
 - Shaders are WGSL, as in a browser. A SPIR-V source is refused.
 - External textures, the `Snorm10_10_10_2` vertex format, compatibility mode,
@@ -235,6 +240,11 @@ or an absent feature:
 A label given to an object after it was created, and the queue's label, are
 accepted natively and go nowhere: wgpu takes a label at creation only.
 
+**With the `dawn` feature** the native backend is [Dawn], Chromium's WebGPU,
+which implements `webgpu.h` itself: the host forwards most calls unchanged,
+and a frame costs noticeably less CPU. It needs a Dawn build (`make dawn`).
+[docs/dawn.md](docs/dawn.md) explains how it is made and what differs.
+
 Window input (keyboard, pointer) is outside `webgpu.h` and not provided.
 
 ## License
@@ -243,6 +253,7 @@ MIT. Third-party material is listed in [NOTICE.md](NOTICE.md).
 
 [`webgpu.h`]: https://github.com/webgpu-native/webgpu-headers
 [wgpu]: https://github.com/gfx-rs/wgpu
+[Dawn]: https://dawn.googlesource.com/dawn
 [wasixcc]: https://github.com/wasix-org/wasixcc
 [Wasmer SDK]: https://github.com/wasmerio/wasmer-sdk
 [JSPI]: https://github.com/WebAssembly/js-promise-integration

@@ -15,7 +15,7 @@ EXAMPLES := $(patsubst examples/%.c,examples/out/%.wasm,$(wildcard examples/*.c)
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST := dist/wasmer-webgpu-guest-$(VERSION)
 
-.PHONY: all guest programs browser-fixture examples dist gen check fmt lint check-web test test-native test-browser clean
+.PHONY: all guest programs browser-fixture examples dist gen check fmt lint lint-dawn check-web test test-native test-dawn test-browser dawn clean
 
 all: guest examples
 
@@ -62,6 +62,10 @@ lint:
 	$(CARGO) clippy --features cli,window --all-targets -- -D warnings
 	$(CARGO) clippy --target wasm32-unknown-unknown --features js --example runtime_hooks -- -D warnings
 
+## The same with the native host on Dawn (needs `make dawn` first).
+lint-dawn:
+	$(CARGO) clippy --features cli,window,dawn --all-targets -- -D warnings
+
 ## The browser half of the crate, as the Wasmer SDK compiles it.
 check-web:
 	$(CARGO) check --target wasm32-unknown-unknown --no-default-features --features js,wasix
@@ -69,9 +73,18 @@ check-web:
 test: test-native
 
 ## Unit tests, the ABI sweep, the conformance programs and the embedder tests.
-## WEBGPU_TEST_FALLBACK_ADAPTER=1 runs them on a software adapter.
+## WEBGPU_TEST_FALLBACK_ADAPTER=1 runs them on a software adapter (empty or 0: off).
 test-native: programs
 	$(CARGO) test --features cli
+
+## The same suite on the Dawn host.
+test-dawn: programs dawn
+	$(CARGO) test --features cli,dawn
+
+## Dawn for the `dawn` feature, at the pinned revision: third_party/dawn/install.
+## Quick when that revision is installed already (the script checks).
+dawn:
+	scripts/build-dawn.sh
 
 ## The conformance programs against js/webgpu_host.js, and the runtime hooks
 ## built for a browser, in the installed Chrome.
@@ -81,3 +94,4 @@ test-browser: programs browser-fixture
 clean:
 	$(CARGO) clean
 	rm -rf lib dist tests/programs/out tests/browser/out examples/out
+	@echo "(third_party/dawn is kept: it takes a while to build)"

@@ -27,9 +27,15 @@ fn program(name: &str) -> PathBuf {
     root.join(format!("tests/programs/out/{name}.wasm"))
 }
 
+/// `WEBGPU_TEST_FALLBACK_ADAPTER` set to anything but nothing or `0`, as for
+/// `manifest_tests`.
+fn fallback_adapter() -> bool {
+    std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 fn builder() -> WebGpuCtxBuilder {
-    WebGpuCtx::builder()
-        .force_fallback_adapter(std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER").is_some())
+    WebGpuCtx::builder().force_fallback_adapter(fallback_adapter())
 }
 
 fn run(ctx: &WebGpuCtx, name: &str) -> RunOutput {
@@ -85,19 +91,67 @@ fn a_frame_sink_is_told_how_the_guest_means_its_colours() {
     assert_eq!(frame.tone_mapping, FrameToneMapping::Extended);
 }
 
-/// `wgpuCommandEncoderWriteTimestamp` goes through wherever the adapter can
-/// write a timestamp from an encoder, and is a validation error elsewhere.
 #[test]
-fn encoder_timestamps_are_written_where_the_adapter_can() {
+fn a_surface_moved_to_another_device_presents_what_that_device_drew() {
+    let sink = CaptureFrames::new(4, 4);
+    let ctx = builder()
+        .surface_provider(Arc::new(SingleSurface(SurfaceTarget::Headless(
+            sink.clone(),
+        ))))
+        .build();
+    // Presents red from one device, then green from another at the same size.
+    let output = run(&ctx, "surface_reconfigure");
+    assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert!(
+        output
+            .stdout
+            .contains("green from the second device: drawn, presented\n"),
+        "{}",
+        output.stdout
+    );
+    // Read back through the second device, not through what the host kept
+    // from the first.
+    let frame = sink.last_frame().expect("a frame was presented");
+    assert_eq!((frame.index, frame.width, frame.height), (1, 4, 4));
+    assert!(
+        frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| *pixel == [0, 255, 0, 255]),
+        "the last frame is solid green: {:?}",
+        frame.pixels
+    );
+}
+
+/// Whether the native host's backend writes a timestamp from an encoder.
+/// wgpu does wherever the adapter can.
+#[cfg(not(feature = "dawn"))]
+fn encoder_timestamps_written() -> bool {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        force_fallback_adapter: std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER").is_some(),
+        force_fallback_adapter: fallback_adapter(),
         ..Default::default()
     }))
     .expect("an adapter for the tests");
-    let able = adapter.features().contains(
-        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
-    );
+    adapter
+        .features()
+        .contains(wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+}
+
+/// Dawn never does for a guest: it keeps them behind its unsafe APIs, as a
+/// browser does, since the WebGPU specification dropped them.
+#[cfg(feature = "dawn")]
+fn encoder_timestamps_written() -> bool {
+    false
+}
+
+/// `wgpuCommandEncoderWriteTimestamp` goes through wherever the backend
+/// writes a timestamp from an encoder, and is a validation error elsewhere.
+#[test]
+fn encoder_timestamps_are_written_where_the_backend_can() {
+    let able = encoder_timestamps_written();
 
     let output = run(&builder().build(), "timestamps");
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);

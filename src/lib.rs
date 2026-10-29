@@ -28,8 +28,15 @@ pub mod abi;
 pub mod cli;
 mod ctx;
 mod env;
-#[cfg(not(target_arch = "wasm32"))]
+// The native host: wgpu by default, Dawn with the `dawn` feature. Both are
+// `crate::host` to the rest of the crate.
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "dawn")))]
 mod host;
+#[cfg(all(not(target_arch = "wasm32"), feature = "dawn"))]
+#[path = "dawn/mod.rs"]
+mod host;
+#[cfg(not(target_arch = "wasm32"))]
+mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod surface;
 #[cfg(feature = "wasix")]

@@ -401,7 +401,7 @@ def emit_api(spec):
     out.append("use wasmer::{AsStoreMut, Exports, Function, FunctionEnv, FunctionEnvMut, RuntimeError};\n")
     out.append("use super::enums::*;\nuse super::structs::*;")
     out.append("use super::{AbiEnum, AbiResult, Cx, Handle, OutPtr};")
-    out.append("use crate::env::WebGpuEnv;\nuse crate::host::enter;\n")
+    out.append("use crate::env::WebGpuEnv;\nuse crate::native::enter;\n")
 
     traits, order = {}, []  # trait name -> method lines
     glue, reg = [], []

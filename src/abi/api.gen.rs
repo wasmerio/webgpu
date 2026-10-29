@@ -6,7 +6,7 @@ use super::enums::*;
 use super::structs::*;
 use super::{AbiEnum, AbiResult, Cx, Handle, OutPtr};
 use crate::env::WebGpuEnv;
-use crate::host::enter;
+use crate::native::enter;
 
 // One trait per object, so a backend implements each in its own file. Arguments
 // arrive decoded from the guest's wasm32 layout. A missing method is a compile

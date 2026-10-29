@@ -1705,10 +1705,18 @@ export function createWebGpuHost({
     return handle;
   };
 
+  // Ends a surface's configuration: the canvas destroys its current texture,
+  // which the guest may still hold.
+  const unconfigure = (surface) => {
+    surface.hasFrame = false;
+    surface.configured = null;
+    surface.context.unconfigure();
+  };
+
   const closeSurface = (surface) => {
     // `dispose` may have closed it before the guest released its handle.
     if (!surfaces.delete(surface)) return;
-    surface.context.unconfigure();
+    unconfigure(surface);
     releaseTarget(surface.target);
   };
 
@@ -2550,6 +2558,11 @@ export function createWebGpuHost({
     // -- surface --------------------------------------------------------------
 
     wgpuSurfaceConfigure: (handle, configPtr) => {
+      // Configuring first unconfigures, as the surface contract says,
+      // whatever comes of the new configuration: the current frame is gone
+      // even when the device or the configuration is refused below.
+      const surface = get(handle, 'Surface');
+      if (surface) unconfigure(surface);
       const C = S.WGPUSurfaceConfiguration;
       required(configPtr, 'config');
       const links = chainOf(configPtr, C, [STYPE.SurfaceColorManagement]);
@@ -2571,7 +2584,6 @@ export function createWebGpuHost({
         configuration.toneMapping = { mode: idl('ToneMappingMode', management + M.toneMappingMode) };
       }
 
-      const surface = get(handle, 'Surface');
       const device = get(mem.u32(configPtr + C.device), 'Device');
       if (!surface || !device) return;
       const fail = (message) => {
@@ -2590,9 +2602,6 @@ export function createWebGpuHost({
         fail('this surface does not support that present mode.');
       }
 
-      // Reconfiguring first unconfigures: the current frame is gone.
-      surface.hasFrame = false;
-      surface.configured = null;
       surface.canvas.width = width;
       surface.canvas.height = height;
       surface.context.configure({ ...configuration, device: device.object, format, usage: usageBits, viewFormats });
@@ -2643,10 +2652,7 @@ export function createWebGpuHost({
 
     wgpuSurfaceUnconfigure: (handle) => {
       const surface = get(handle, 'Surface');
-      if (!surface) return;
-      surface.hasFrame = false;
-      surface.configured = null;
-      surface.context.unconfigure();
+      if (surface) unconfigure(surface);
     },
 
     // A canvas context has no label to set.

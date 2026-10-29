@@ -12,7 +12,6 @@ mod buffer;
 mod convert;
 mod device;
 mod encoder;
-mod events;
 mod instance;
 mod pass;
 mod pipeline;
@@ -26,20 +25,18 @@ mod table;
 mod texture;
 mod upload;
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
-use wasmer::{FunctionEnvMut, RuntimeError, StoreMut};
+use wasmer::StoreMut;
 
 use crate::abi::enums::ErrorType;
-use crate::abi::{AbiError, AbiResult, Cx, GuestMemory, Handle};
+use crate::abi::{AbiError, Handle};
 use crate::ctx::{CtxInner, WebGpuCtx};
-use crate::env::WebGpuEnv;
+use crate::native::{DEFAULT_MAX_PENDING_EVENTS, HostControl, host_for_memory};
 
-pub(crate) use events::{Events, Record};
+pub(crate) use crate::native::events::{Events, Record};
+pub(crate) use crate::native::{catch_expected_panic, lock, log};
 pub(crate) use table::{Object, ObjectKind};
 
 pub(crate) use adapter::AdapterState;
@@ -49,63 +46,18 @@ pub(crate) use instance::InstanceState;
 pub(crate) use surface::SurfaceState;
 pub(crate) use texture::TextureState;
 
-/// Locks a mutex, ignoring poisoning: a panic inside one import is turned into
-/// a guest trap by [`enter`], and must not take the rest of the process's GPU
-/// state down with it.
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Whether the tests should ask for a software adapter:
+/// `WEBGPU_TEST_FALLBACK_ADAPTER` set to anything but nothing or `0`.
+#[cfg(test)]
+pub(crate) fn test_fallback_adapter() -> bool {
+    std::env::var_os("WEBGPU_TEST_FALLBACK_ADAPTER")
+        .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
-fn logging() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("WASMER_WEBGPU_LOG").is_some())
-}
-
-/// Diagnostics for embedders, enabled with `WASMER_WEBGPU_LOG=1`. Guests learn
-/// about their mistakes through WebGPU's own error reporting, not from this.
-pub(crate) fn log(message: impl FnOnce() -> String) {
-    if logging() {
-        eprintln!("[wasmer-webgpu] {}", message());
-    }
-}
-
-/// Futureless events (uncaptured errors) kept for a guest that does not
-/// collect them, unless the embedder says otherwise.
-const DEFAULT_MAX_PENDING_EVENTS: usize = 4096;
 /// Async pipeline creations a process's compiler lane holds at once: queued,
 /// compiling, or finished but not collected yet. Beyond it, a creation is
 /// compiled on the calling thread.
 const PIPELINE_LANE_CAPACITY: usize = 64;
-
-/// What the embedder-facing context needs from a guest process's host.
-pub(crate) trait HostControl: Any + Send + Sync {
-    fn terminate(&self);
-    /// (devices, live object handles, bytes of buffer and texture storage)
-    fn usage(&self) -> (usize, usize, u64);
-}
-
-/// Host state of every guest process of one [`WebGpuCtx`].
-///
-/// Held as trait objects so that the context's own `Send`/`Sync` do not
-/// depend on wgpu's object graph (a proof deep enough to need a raised
-/// recursion limit, which embedders should not have to copy).
-#[derive(Default)]
-pub(crate) struct HostRegistry {
-    /// Threads of a process share one linear memory, and every instance of the
-    /// process must reach the same [`Host`]: keyed by the memory's base.
-    by_memory: HashMap<usize, Weak<dyn Any + Send + Sync>>,
-    all: Vec<Weak<dyn HostControl>>,
-}
-
-impl HostRegistry {
-    pub(crate) fn live(&mut self) -> Vec<Arc<dyn HostControl>> {
-        self.all.retain(|host| host.strong_count() > 0);
-        self.by_memory.retain(|_, host| host.strong_count() > 0);
-        self.all.iter().filter_map(Weak::upgrade).collect()
-    }
-}
 
 /// Everything the WebGPU imports of one guest process share.
 pub(crate) struct Host {
@@ -155,25 +107,7 @@ impl Host {
         store: &mut StoreMut<'_>,
         memory: &wasmer::Memory,
     ) -> Arc<Self> {
-        let shared = memory.ty(store).shared;
-        let base = memory.view(store).data_ptr() as usize;
-        let mut registry = lock(&ctx.inner.hosts);
-        registry.live();
-        if shared
-            && base != 0
-            && let Some(host) = registry.by_memory.get(&base).and_then(Weak::upgrade)
-            && let Ok(host) = host.downcast::<Self>()
-        {
-            return host;
-        }
-        let host = Arc::new(Self::new(Arc::clone(&ctx.inner)));
-        if shared && base != 0 {
-            let any: Arc<dyn Any + Send + Sync> = host.clone();
-            registry.by_memory.insert(base, Arc::downgrade(&any));
-        }
-        let control: Arc<dyn HostControl> = host.clone();
-        registry.all.push(Arc::downgrade(&control));
-        host
+        host_for_memory(ctx, store, memory, || Self::new(Arc::clone(&ctx.inner)))
     }
 
     pub(crate) fn is_terminated(&self) -> bool {
@@ -290,163 +224,6 @@ impl HostControl for Host {
     }
 }
 
-thread_local! {
-    /// Set while this thread runs a call whose panic is an expected outcome.
-    static EXPECTING_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Runs `f`, turning a panic into `Err(message)` without the panic hook
-/// printing it.
-///
-/// wgpu reports a few validation failures by panicking. Where the host knows
-/// such a call can fail on guest input, the failure is an ordinary WebGPU
-/// error, and must not show up on the embedder's stderr as a crash report.
-pub(crate) fn catch_expected_panic<R>(f: impl FnOnce() -> R) -> Result<R, String> {
-    static HOOK: std::sync::Once = std::sync::Once::new();
-    HOOK.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if !EXPECTING_PANIC.get() {
-                previous(info);
-            }
-        }));
-    });
-    EXPECTING_PANIC.set(true);
-    let result = catch_unwind(AssertUnwindSafe(f));
-    EXPECTING_PANIC.set(false);
-    result.map_err(|panic| panic_message(&*panic))
-}
-
-fn panic_message(panic: &(dyn Any + Send)) -> String {
-    panic
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_owned())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_owned())
-}
-
-/// Whether the process whose memory this is was killed. WASIX disables the
-/// atomics of a killed process's memory to shake its threads out of their
-/// waits; a wait of no duration on an address nobody notifies tells whether
-/// that has happened, and nothing else.
-fn killed(probe: &wasmer::MemoryOps) -> bool {
-    matches!(
-        probe.wait(
-            wasmer::MemoryLocation::new_32(u32::MAX),
-            Some(std::time::Duration::ZERO)
-        ),
-        Err(wasmer::AtomicsError::AtomicsDisabled)
-    )
-}
-
-/// Runs one import: resolves the calling instance's memory and host, decodes
-/// through `f`, and turns failures into the right kind of guest-visible
-/// outcome.
-///
-/// - A guest pointer outside linear memory traps, like the segfault it is,
-///   whatever the implementation did with the failed copy.
-/// - A guest stopped while the call waited is stopped: the call traps, as
-///   soon as the call saw it, whatever the call returned.
-/// - Any other decoding error makes the call return its zero value.
-/// - A panic below (wgpu panics on a few misuse paths) traps this call
-///   instead of unwinding through the wasm frames into the embedder.
-pub(crate) fn enter<R: Default>(
-    env: &mut FunctionEnvMut<'_, WebGpuEnv>,
-    function: &'static str,
-    f: impl FnOnce(&Host, &mut Cx<'_>) -> AbiResult<R>,
-) -> Result<R, RuntimeError> {
-    let (data, store) = env.data_and_store_mut();
-    let (Some(host), Some(memory)) = (data.host.clone(), data.memory.as_ref()) else {
-        return Err(RuntimeError::new(format!(
-            "{function}: WebGPU was called before the instance was set up"
-        )));
-    };
-    // Only a kill stops a call. A context shut down by its embedder
-    // (`terminate_all`) leaves its guests running, with their devices lost.
-    let probe = data.kill_probe.clone();
-    let stopped = || probe.as_ref().is_some_and(killed);
-    let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
-    let outcome = catch_unwind(AssertUnwindSafe(|| f(&host, &mut cx)));
-    finish(&host, function, &cx, outcome)
-}
-
-/// What a call that ran becomes for the guest; see [`enter`].
-fn finish<R: Default>(
-    host: &Host,
-    function: &'static str,
-    cx: &Cx<'_>,
-    outcome: std::thread::Result<AbiResult<R>>,
-) -> Result<R, RuntimeError> {
-    // Checked before anything else: an implementation may have turned a
-    // failed copy into a status of its own, and a wild pointer still traps.
-    if let Some(fault) = cx.mem.take_fault() {
-        return Err(RuntimeError::new(format!("{function}: {fault}")));
-    }
-    // Likewise a call that found its guest stopped, even one that went on to
-    // return a status or nothing at all.
-    if cx.take_stop() {
-        return Err(RuntimeError::new(format!(
-            "{function}: {}",
-            AbiError::Stopped
-        )));
-    }
-    match outcome {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error @ (AbiError::OutOfBounds { .. } | AbiError::Stopped))) => {
-            Err(RuntimeError::new(format!("{function}: {error}")))
-        }
-        Ok(Err(error)) => {
-            host.abi_error(function, &error);
-            Ok(R::default())
-        }
-        Err(panic) => {
-            let message = panic_message(&*panic);
-            log(|| format!("{function} panicked: {message}"));
-            Err(RuntimeError::new(format!(
-                "{function}: the WebGPU backend failed: {message}"
-            )))
-        }
-    }
-}
-
-#[cfg(test)]
-mod finish_tests {
-    use super::*;
-
-    fn with_cx(stopped: bool, f: impl FnOnce(&Host, &Cx<'_>)) {
-        let host = Host::new(Arc::clone(&crate::WebGpuCtx::default().inner));
-        let mut store = wasmer::Store::default();
-        let memory =
-            wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false)).unwrap();
-        let stopped = move || stopped;
-        f(
-            &host,
-            &Cx::new(GuestMemory::new(memory.view(&store)), &stopped),
-        );
-    }
-
-    #[test]
-    fn a_call_that_saw_its_guest_stopped_traps_whatever_it_returned() {
-        with_cx(true, |host, cx| {
-            assert!(cx.stopped());
-            let error = finish(host, "wgpuTest", cx, Ok(Ok(7))).expect_err("traps");
-            assert!(error.to_string().contains("stopped"), "{error}");
-        });
-    }
-
-    #[test]
-    fn a_call_that_never_asked_returns_what_it_returned() {
-        // Only a check that sees the stop makes the call trap.
-        with_cx(true, |host, cx| {
-            assert_eq!(finish(host, "wgpuTest", cx, Ok(Ok(7))).unwrap(), 7);
-        });
-        with_cx(false, |host, cx| {
-            assert!(!cx.stopped());
-            assert_eq!(finish(host, "wgpuTest", cx, Ok(Ok(7))).unwrap(), 7);
-        });
-    }
-}
-
 /// The browser host (`js/webgpu_host.js`) is a second implementation of this
 /// one. What it shares with it by layout comes from the generated tables;
 /// these few numbers it writes out by hand, and they must not drift.
@@ -505,14 +282,14 @@ mod parity {
         );
         assert_eq!(
             browser_constant("DEFAULT_MAX_PENDING_EVENTS"),
-            super::DEFAULT_MAX_PENDING_EVENTS as u64
+            crate::native::DEFAULT_MAX_PENDING_EVENTS as u64
         );
         // The event record's header, which the shim parses too.
-        let header = format!("size: {} }}", super::events::RECORD_HEADER_SIZE);
+        let header = format!("size: {} }}", crate::native::events::RECORD_HEADER_SIZE);
         assert!(
             BROWSER_HOST.contains(&header),
             "the browser host's event record header is not {} bytes",
-            super::events::RECORD_HEADER_SIZE
+            crate::native::events::RECORD_HEADER_SIZE
         );
     }
 }
