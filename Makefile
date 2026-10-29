@@ -1,6 +1,7 @@
 # Everyday tasks. Nothing here is needed to use the crate from Rust: cargo
 # builds it. The guest library and the test programs need wasixcc
-# (https://github.com/wasix-org/wasixcc).
+# (https://github.com/wasix-org/wasixcc); the browser fixture needs the
+# wasm32-unknown-unknown target and the wasm-bindgen CLI of Cargo.lock's version.
 
 CARGO ?= cargo
 PYTHON ?= python3
@@ -14,7 +15,7 @@ EXAMPLES := $(patsubst examples/%.c,examples/out/%.wasm,$(wildcard examples/*.c)
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST := dist/wasmer-webgpu-guest-$(VERSION)
 
-.PHONY: all guest programs examples dist gen check fmt lint check-web test test-native test-browser clean
+.PHONY: all guest programs browser-fixture examples dist gen check fmt lint check-web test test-native test-browser clean
 
 all: guest examples
 
@@ -25,6 +26,10 @@ guest:
 ## The conformance programs: tests/programs/out/*.wasm
 programs: guest
 	tests/build-test-wasix.sh
+
+## The runtime hooks as a browser embedder uses them: tests/browser/out/runtime_hooks
+browser-fixture:
+	CARGO="$(CARGO)" tests/browser/build-runtime-hooks.sh
 
 examples: $(EXAMPLES)
 
@@ -55,6 +60,7 @@ fmt:
 
 lint:
 	$(CARGO) clippy --features cli,window --all-targets -- -D warnings
+	$(CARGO) clippy --target wasm32-unknown-unknown --features js --example runtime_hooks -- -D warnings
 
 ## The browser half of the crate, as the Wasmer SDK compiles it.
 check-web:
@@ -67,10 +73,11 @@ test: test-native
 test-native: programs
 	$(CARGO) test --features cli
 
-## The conformance programs against js/webgpu_host.js, in the installed Chrome.
-test-browser: programs
+## The conformance programs against js/webgpu_host.js, and the runtime hooks
+## built for a browser, in the installed Chrome.
+test-browser: programs browser-fixture
 	cd tests/browser && npm install --no-audit --no-fund && node run.mjs --no-build
 
 clean:
 	$(CARGO) clean
-	rm -rf lib dist tests/programs/out examples/out
+	rm -rf lib dist tests/programs/out tests/browser/out examples/out

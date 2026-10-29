@@ -61,19 +61,31 @@ export function wasmer_webgpu_default_get_canvas(selector, scope) {
 export function wasmer_webgpu_has_jspi() {
   return typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function';
 }
+export function wasmer_webgpu_host_created(host, scope) {
+  // An embedder with work of its own in this worker learns of each host, for
+  // what the host offers beyond the guest's imports: `copyExternalImage`
+  // hands the guest an image the embedder holds.
+  const created = globalThis.__wasmerWebGpuHostCreated;
+  if (typeof created === 'function') created(host, scope);
+}
 ")]
 extern "C" {
     #[wasm_bindgen(js_name = wasmer_webgpu_default_get_canvas)]
     fn default_get_canvas(selector: &JsValue, scope: u32) -> JsValue;
     #[wasm_bindgen(js_name = wasmer_webgpu_has_jspi)]
     fn has_jspi() -> bool;
+    #[wasm_bindgen(js_name = wasmer_webgpu_host_created, catch)]
+    fn host_created(host: &JsValue, scope: u32) -> Result<(), JsValue>;
 }
 
 /// The JavaScript host of one guest instance, with the callbacks it was given.
 pub(crate) struct JsHost {
     host: JsValue,
+    /// The context's canvas scope, which the embedder is told with the host.
+    scope: u32,
     _get_canvas: Closure<dyn Fn(JsValue) -> JsValue>,
     _is_terminated: Closure<dyn Fn() -> bool>,
+    _event_waker: Option<Closure<dyn Fn()>>,
 }
 
 // SAFETY: a JavaScript value never leaves the realm (the worker) it was
@@ -231,6 +243,15 @@ pub(crate) fn add_imports(
         Closure::<dyn Fn() -> bool>::new(move || stopped.stopped.load(Ordering::Acquire));
     set(&options, "getCanvas", get_canvas.as_ref().clone())?;
     set(&options, "isTerminated", is_terminated.as_ref().clone())?;
+    // The host calls it in this worker, when an event becomes ready.
+    let event_waker = ctx
+        .inner
+        .event_waker
+        .clone()
+        .map(|wake| Closure::<dyn Fn()>::new(move || wake()));
+    if let Some(waker) = &event_waker {
+        set(&options, "eventWaker", waker.as_ref().clone())?;
+    }
     set(&options, "suspending", JsValue::from(jspi))?;
     set(
         &options,
@@ -264,8 +285,10 @@ pub(crate) fn add_imports(
     // The host calls these for as long as it lives; it owns them from here.
     let host = JsHost {
         host,
+        scope,
         _get_canvas: get_canvas,
         _is_terminated: is_terminated,
+        _event_waker: event_waker,
     };
 
     let mut exports = Exports::new();
@@ -308,7 +331,10 @@ pub(crate) fn add_imports(
     Ok(())
 }
 
-/// Tells the instance's JavaScript host which memory its pointers refer to.
+/// Tells the instance's JavaScript host which memory its pointers refer to,
+/// then tells the embedder about the host: only a host whose instance exists
+/// is announced. It is disposed of with the instance, after which
+/// `copyExternalImage` answers false.
 pub(crate) fn configure_instance(
     store: &mut StoreMut<'_>,
     env: &FunctionEnv<WebGpuEnv>,
@@ -327,5 +353,7 @@ pub(crate) fn configure_instance(
     set_memory
         .call1(&host.host, &memory)
         .map_err(|error| js_error("binding guest memory to the JavaScript WebGPU host", &error))?;
+    host_created(&host.host, host.scope)
+        .map_err(|error| js_error("the embedder's __wasmerWebGpuHostCreated", &error))?;
     Ok(())
 }

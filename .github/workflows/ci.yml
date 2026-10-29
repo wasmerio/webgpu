@@ -84,6 +84,12 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen, at the version of Cargo.lock
+        run: cargo install wasm-bindgen-cli --locked --version "$(sed -n '/^name = "wasm-bindgen"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock)"
       - name: Install wasixcc
         uses: wasix-org/wasixcc@v0.4.3
         with:

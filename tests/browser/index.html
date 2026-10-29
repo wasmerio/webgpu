@@ -19,12 +19,14 @@
 <script type="module">
   import { runHostTests } from './host_tests.js';
   import { runProgram } from './runner.js';
+  import { runRuntimeHookTests } from './runtime_hooks.js';
   import { runAbiSweep } from './sweep.js';
 
   // run.mjs calls these through the page.
   window.runProgram = runProgram;
   window.runAbiSweep = runAbiSweep;
   window.runHostTests = runHostTests;
+  window.runRuntimeHookTests = runRuntimeHookTests;
 
   // Opened by hand: run the manifest and show what happened.
   if (!navigator.webdriver) {

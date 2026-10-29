@@ -1,6 +1,7 @@
 target/
 lib/
 tests/programs/out/
+tests/browser/out/
 examples/out/
 dist/
 node_modules/
