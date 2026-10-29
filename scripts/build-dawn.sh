@@ -56,6 +56,8 @@ case "$(uname -s)" in
         ;;
 esac
 
+# DAWN_SUPPORTS_CXX_MODULES=OFF: the bindings need no C++ module, and GCC 13
+# cannot scan one (CMake refuses to generate the build).
 # shellcheck disable=SC2086 # PLATFORM is a list of arguments
 cmake -S "$SRC" -B "$OUT" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
@@ -72,6 +74,7 @@ cmake -S "$SRC" -B "$OUT" -G Ninja \
     -DDAWN_BUILD_NODE_BINDINGS=OFF \
     -DDAWN_BUILD_PROTOBUF=OFF \
     -DDAWN_USE_GLFW=OFF \
+    -DDAWN_SUPPORTS_CXX_MODULES=OFF \
     -DTINT_BUILD_TESTS=OFF \
     -DTINT_BUILD_CMD_TOOLS=OFF \
     -DTINT_BUILD_BENCHMARKS=OFF \
