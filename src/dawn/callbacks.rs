@@ -292,7 +292,7 @@ impl Drop for DonePipeline {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             // SAFETY: the reference Dawn handed the callback.
-            unsafe { self.kind.release(self.raw) };
+            crate::native::autoreleased(|| unsafe { self.kind.release(self.raw) });
         }
     }
 }

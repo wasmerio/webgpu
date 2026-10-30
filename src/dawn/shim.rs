@@ -71,8 +71,10 @@ impl Host {
     /// their handles.
     fn progress(&self) {
         if let Some(dawn) = self.dawn.get().and_then(Option::as_ref) {
-            // SAFETY: the host's live instance.
-            unsafe { ffi::wgpuInstanceProcessEvents(dawn.0) };
+            // SAFETY: the host's live instance. It ticks every device of the
+            // process, which can submit their work: drained each time, not
+            // when a long wait's import returns.
+            crate::native::autoreleased(|| unsafe { ffi::wgpuInstanceProcessEvents(dawn.0) });
         }
         self.publish_pipelines();
     }
@@ -514,14 +516,14 @@ impl ShimApi for Host {
                         })
                         .collect();
                     // SAFETY: the host's live instance and futures it started.
-                    let status = unsafe {
+                    let status = crate::native::autoreleased(|| unsafe {
                         ffi::wgpuInstanceWaitAny(
                             dawn.0,
                             waits.len(),
                             waits.as_mut_ptr(),
                             slice.as_nanos() as u64,
                         )
-                    };
+                    });
                     // Dawn may be unable to wait on this mix of futures at
                     // once (several queues, or a queue's with another kind,
                     // on backends without spontaneous queue events): it says

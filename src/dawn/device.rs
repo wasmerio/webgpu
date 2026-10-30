@@ -102,11 +102,12 @@ unsafe impl Sync for DeviceState {}
 
 impl Drop for DeviceState {
     fn drop(&mut self) {
-        // SAFETY: the host's own references.
-        unsafe {
+        // SAFETY: the host's own references. The last one destroys the device,
+        // whose final submission Metal autoreleases (`autoreleased`).
+        crate::native::autoreleased(|| unsafe {
             ffi::wgpuQueueRelease(self.queue);
             ffi::wgpuDeviceRelease(self.raw);
-        }
+        });
     }
 }
 
@@ -128,7 +129,7 @@ impl DeviceState {
     pub(crate) fn destroy(&self) {
         let _copies = exclusive(&self.access);
         // SAFETY: a live device.
-        unsafe { ffi::wgpuDeviceDestroy(self.raw) };
+        crate::native::autoreleased(|| unsafe { ffi::wgpuDeviceDestroy(self.raw) });
         self.link.on_lost(
             DeviceLostReason::Destroyed.as_u32(),
             "Device was destroyed.".to_owned(),

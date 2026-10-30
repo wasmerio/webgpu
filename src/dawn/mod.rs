@@ -91,7 +91,7 @@ impl Drop for Native {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             // SAFETY: `raw` is a live object of this kind, and this its reference.
-            unsafe { self.kind.release(self.raw) };
+            crate::native::autoreleased(|| unsafe { self.kind.release(self.raw) });
         }
     }
 }
@@ -118,7 +118,7 @@ unsafe impl Sync for DawnInstance {}
 impl Drop for DawnInstance {
     fn drop(&mut self) {
         // SAFETY: the host's own reference.
-        unsafe { ffi::wgpuInstanceRelease(self.0) };
+        crate::native::autoreleased(|| unsafe { ffi::wgpuInstanceRelease(self.0) });
     }
 }
 
@@ -315,6 +315,14 @@ impl HostControl for Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.terminated.store(true, Ordering::Release);
+        // Destroy the devices while the table still holds them: Dawn finishes
+        // their work in flight here, such as an async pipeline whose callback
+        // holds the device. Left to the table, the device's last reference
+        // could go in that callback, on Dawn's worker thread, where destroying
+        // it waits for that very task: thread, device and instance would stay.
+        for device in self.live_devices() {
+            device.destroy();
+        }
     }
 }
 

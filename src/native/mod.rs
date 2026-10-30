@@ -25,6 +25,42 @@ use crate::host::Host;
 /// collect them, unless the embedder says otherwise.
 pub(crate) const DEFAULT_MAX_PENDING_EVENTS: usize = 4096;
 
+/// Runs `f` in an Objective-C autorelease pool on Apple platforms, where the
+/// GPU library is Metal underneath.
+///
+/// Metal autoreleases objects, among them the completion handlers of each
+/// command buffer, which hold the queue and through it the device. A guest's
+/// threads are the embedder's, which keep no pool of their own, so what they
+/// autoreleased stayed until the thread exited; an embedder whose threads
+/// never exit kept every device its guests made, and the instance with it.
+/// Imports run in one ([`enter`]); on the Dawn host, so does each call outside
+/// an import that can tick a device: releases, destroys and waits.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn autoreleased<R>(f: impl FnOnce() -> R) -> R {
+    use std::ffi::c_void;
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
+    }
+    struct Pool(*mut c_void);
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            // SAFETY: the pool this thread pushed last, still open.
+            unsafe { objc_autoreleasePoolPop(self.0) };
+        }
+    }
+    // SAFETY: pushes a pool on this thread; `Pool` pops it, unwinding too.
+    let _pool = Pool(unsafe { objc_autoreleasePoolPush() });
+    f()
+}
+
+/// Elsewhere nothing is autoreleased.
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn autoreleased<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Locks a mutex, ignoring poisoning: a panic inside one import is turned into
 /// a guest trap by [`enter`], and must not take the rest of the process's GPU
 /// state down with it.
@@ -180,7 +216,7 @@ pub(crate) fn enter<R: Default>(
     let probe = data.kill_probe.clone();
     let stopped = || probe.as_ref().is_some_and(killed);
     let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
-    let outcome = catch_unwind(AssertUnwindSafe(|| f(&host, &mut cx)));
+    let outcome = autoreleased(|| catch_unwind(AssertUnwindSafe(|| f(&host, &mut cx))));
     finish(function, &cx, outcome)
 }
 
