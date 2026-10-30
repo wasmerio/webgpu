@@ -48,6 +48,12 @@ pub(crate) trait Lower {
     fn lower(&self, l: &mut Lowering<'_>) -> Result<Self::Native, Invalid>;
 }
 
+/// A webgpu.h enum value the guest left `undefined` (1), as `default`; any
+/// other value as it is.
+pub(crate) fn undefined_as(value: u32, default: u32) -> u32 {
+    if value == 1 { default } else { value }
+}
+
 /// `size_t` values travel as 32 bits in the guest; `SIZE_MAX` stays the
 /// sentinel it is (`WGPU_STRLEN`, `WGPU_WHOLE_MAP_SIZE`).
 pub(crate) fn usize_from_guest(value: u32) -> usize {

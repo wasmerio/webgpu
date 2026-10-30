@@ -71,6 +71,17 @@ REFUSED_EXTENSIONS = {
 # so: WebGPU lets a pipeline layout leave a bind group slot empty.
 NULLABLE_ELEMENTS = {"pipeline_layout_descriptor.bind_group_layouts"}
 
+# Binding layout members webgpu.h defaults when a guest leaves them
+# `undefined`. Dawn's frontend applies only the view dimension defaults, and
+# refuses an undefined type here, so the host lowers these to their default.
+# (`binding not used`, which marks the member unused, stays as it is.)
+UNDEFINED_DEFAULTS = {
+    "buffer_binding_layout.type": "uniform",
+    "sampler_binding_layout.type": "filtering",
+    "texture_binding_layout.sample_type": "float",
+    "storage_texture_binding_layout.access": "write_only",
+}
+
 
 def ident(name):
     return "r#" + name if name in RUST_KEYWORDS else name
@@ -380,6 +391,12 @@ def lower_member(spec, s, m, field):
             return ["n.%s = usize_from_guest(self.%s);" % (ident(m.c_name), field)]
         return ["n.%s = self.%s;" % (ident(m.c_name), field)]
     if ty.kind == "enum":
+        default = UNDEFINED_DEFAULTS.get("%s.%s" % (s.name, m.name))
+        if default:
+            values = dict(spec.enum_by_name[ty.base].entries)
+            assert values["undefined"] == 1, ty.base
+            return ["n.%s = undefined_as(self.%s.as_u32(), 0x%X); // %s" % (
+                ident(m.c_name), field, values[default], default)]
         if strict_enum(spec, ty):
             return ["n.%s = self.%s.as_u32();" % (ident(m.c_name), field)]
         return ["n.%s = self.%s;" % (ident(m.c_name), field)]
@@ -402,7 +419,7 @@ def emit_lower(spec):
     out.append("//! Decoded guest structs (`crate::abi::structs`) to native ones (`super::ffi`).\n")
     out.append("#![allow(clippy::field_reassign_with_default, unused_mut, unused_variables)]\n")
     out.append("use super::ffi::*;")
-    out.append("use super::lower::{Invalid, Lower, Lowering, usize_from_guest};")
+    out.append("use super::lower::{Invalid, Lower, Lowering, undefined_as, usize_from_guest};")
     out.append("use crate::abi::AbiEnum;")
     out.append("use crate::abi::structs as g;\n")
     extensions = [s for s in native_structs(spec) if s.kind == "extension"]

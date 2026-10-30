@@ -80,6 +80,73 @@ fn a_wgsl_source_lowers_to_its_native_chain_link() {
 }
 
 #[test]
+fn undefined_binding_types_lower_to_their_defaults() {
+    use crate::abi::AbiEnum;
+    use crate::abi::enums::{
+        BufferBindingType as B, SamplerBindingType as S, StorageTextureAccess as A,
+        TextureSampleType as T,
+    };
+    let host = host();
+    let mut l = Lowering::new(&host, None);
+    let entry = |buffer, sampler, texture, access| g::BindGroupLayoutEntry {
+        buffer: g::BufferBindingLayout {
+            type_: buffer,
+            ..Default::default()
+        },
+        sampler: g::SamplerBindingLayout {
+            type_: sampler,
+            ..Default::default()
+        },
+        texture: g::TextureBindingLayout {
+            sample_type: texture,
+            ..Default::default()
+        },
+        storage_texture: g::StorageTextureBindingLayout {
+            access,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let types = |n: ffi::WGPUBindGroupLayoutEntry| {
+        (
+            n.buffer.r#type,
+            n.sampler.r#type,
+            n.texture.sampleType,
+            n.storageTexture.access,
+        )
+    };
+    // webgpu.h's defaults, which Dawn's frontend does not apply here.
+    let undefined = entry(B::Undefined, S::Undefined, T::Undefined, A::Undefined);
+    assert_eq!(
+        types(undefined.lower(&mut l).expect("lowers")),
+        (
+            B::Uniform.as_u32(),
+            S::Filtering.as_u32(),
+            T::Float.as_u32(),
+            A::WriteOnly.as_u32()
+        )
+    );
+    // Unused members stay unused, and given values stay as they are.
+    let unused = entry(
+        B::BindingNotUsed,
+        S::BindingNotUsed,
+        T::BindingNotUsed,
+        A::BindingNotUsed,
+    );
+    assert_eq!(types(unused.lower(&mut l).expect("lowers")), (0, 0, 0, 0));
+    let given = entry(B::ReadOnlyStorage, S::Comparison, T::Depth, A::ReadWrite);
+    assert_eq!(
+        types(given.lower(&mut l).expect("lowers")),
+        (
+            B::ReadOnlyStorage.as_u32(),
+            S::Comparison.as_u32(),
+            T::Depth.as_u32(),
+            A::ReadWrite.as_u32()
+        )
+    );
+}
+
+#[test]
 fn nothing_a_guest_cannot_vouch_for_reaches_dawn() {
     let host = host();
     let mut l = Lowering::new(&host, None);

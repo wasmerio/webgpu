@@ -5,7 +5,7 @@
 #![allow(clippy::field_reassign_with_default, unused_mut, unused_variables)]
 
 use super::ffi::*;
-use super::lower::{Invalid, Lower, Lowering, usize_from_guest};
+use super::lower::{Invalid, Lower, Lowering, undefined_as, usize_from_guest};
 use crate::abi::AbiEnum;
 use crate::abi::structs as g;
 
@@ -171,7 +171,7 @@ impl Lower for g::BufferBindingLayout {
     fn lower(&self, l: &mut Lowering<'_>) -> Result<WGPUBufferBindingLayout, Invalid> {
         let mut n = WGPUBufferBindingLayout::default();
         n.nextInChain = chain(l, &self.chain)?;
-        n.r#type = self.type_.as_u32();
+        n.r#type = undefined_as(self.type_.as_u32(), 0x2); // uniform
         n.hasDynamicOffset = WGPUBool::from(self.has_dynamic_offset);
         n.minBindingSize = self.min_binding_size;
         Ok(n)
@@ -702,7 +702,7 @@ impl Lower for g::SamplerBindingLayout {
     fn lower(&self, l: &mut Lowering<'_>) -> Result<WGPUSamplerBindingLayout, Invalid> {
         let mut n = WGPUSamplerBindingLayout::default();
         n.nextInChain = chain(l, &self.chain)?;
-        n.r#type = self.type_.as_u32();
+        n.r#type = undefined_as(self.type_.as_u32(), 0x2); // filtering
         Ok(n)
     }
 }
@@ -764,7 +764,7 @@ impl Lower for g::StorageTextureBindingLayout {
     fn lower(&self, l: &mut Lowering<'_>) -> Result<WGPUStorageTextureBindingLayout, Invalid> {
         let mut n = WGPUStorageTextureBindingLayout::default();
         n.nextInChain = chain(l, &self.chain)?;
-        n.access = self.access.as_u32();
+        n.access = undefined_as(self.access.as_u32(), 0x2); // write_only
         n.format = self.format.as_u32();
         n.viewDimension = self.view_dimension.as_u32();
         Ok(n)
@@ -912,7 +912,7 @@ impl Lower for g::TextureBindingLayout {
     fn lower(&self, l: &mut Lowering<'_>) -> Result<WGPUTextureBindingLayout, Invalid> {
         let mut n = WGPUTextureBindingLayout::default();
         n.nextInChain = chain(l, &self.chain)?;
-        n.sampleType = self.sample_type.as_u32();
+        n.sampleType = undefined_as(self.sample_type.as_u32(), 0x2); // float
         n.viewDimension = self.view_dimension.as_u32();
         n.multisampled = WGPUBool::from(self.multisampled);
         Ok(n)
