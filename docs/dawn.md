@@ -108,6 +108,16 @@ ABI:
 - `WGPU_WHOLE_SIZE` as the size of `wgpuCommandEncoderCopyBufferToBuffer`
   means the rest of the source, as in the browser host, although Dawn's C
   API takes only real sizes.
+- `WebGpuCtxBuilder::renderer_mapped_draw_buffers` lets one device of each
+  guest process have Dawn's `BufferMapExtendedUsages`: buffers that are
+  mappable and also uniform, vertex, index or storage buffers, which a
+  renderer writes its draw data straight into instead of staging it and
+  copying it on the GPU. Dawn calls the feature experimental and grants it
+  only with its `allow_unsafe_apis` toggle, so the option is off by default
+  and is for an embedder whose guest is its own renderer; no other device of
+  the process gets the toggle. A guest that asks for the feature without it
+  is refused, as it is for any other feature outside `webgpu.h`. The wgpu
+  host has nothing like it.
 - `WebGpuCtxBuilder::force_fallback_adapter` (`WEBGPU_TEST_FALLBACK_ADAPTER`
   for the tests) asks Dawn for its fallback adapter, and Dawn has one only
   with SwiftShader, which this build leaves out: Mesa's lavapipe or WARP are

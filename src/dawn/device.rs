@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use super::adapter::{AdapterState, standard_features, write_limits};
 use super::callbacks::InFlight;
-use super::dawn_ext::{FEATURE_IMPLICIT_DEVICE_SYNCHRONIZATION, wgpuDeviceInjectError};
+use super::dawn_ext::{
+    FEATURE_BUFFER_MAP_EXTENDED_USAGES, FEATURE_IMPLICIT_DEVICE_SYNCHRONIZATION,
+    STYPE_DAWN_TOGGLES_DESCRIPTOR, WGPUDawnTogglesDescriptor, wgpuDeviceInjectError,
+};
 use super::ffi::{self, Kind};
 use super::lower::Lowering;
 use super::{
@@ -16,6 +19,18 @@ use super::{
 use crate::abi::enums::{CallbackMode, DeviceLostReason, ErrorType, FeatureName, Status};
 use crate::abi::structs::{DeviceDescriptor, Limits};
 use crate::abi::{AbiEnum, Cx, EVENT_DEVICE_LOST, EVENT_UNCAPTURED_ERROR, Handle, OutPtr};
+
+/// A process's grant of mappable draw buffers, given back on drop unless the
+/// device that took it was made.
+struct Grant<'a>(Option<&'a AtomicBool>);
+
+impl Drop for Grant<'_> {
+    fn drop(&mut self) {
+        if let Some(granted) = self.0 {
+            granted.store(false, Ordering::Release);
+        }
+    }
+}
 
 /// What a device's callbacks need. Dawn calls them on any thread.
 pub(crate) struct DeviceLink {
@@ -237,13 +252,26 @@ impl Host {
             )));
         }
 
-        // Only webgpu.h's features: Dawn has more, which a guest never hears
-        // of and may not ask for.
-        if let Some(feature) = descriptor.and_then(|descriptor| {
+        // Mappable draw buffers come with Dawn's unsafe APIs: only where the
+        // embedder allows them (its guest is its own renderer), and for one
+        // device of the process. A request that fails gives the grant back.
+        let mapped_draw_buffers = descriptor.is_some_and(|descriptor| {
             descriptor
                 .required_features
-                .iter()
-                .find(|&&feature| FeatureName::from_u32(feature).is_none())
+                .contains(&FEATURE_BUFFER_MAP_EXTENDED_USAGES)
+        }) && self.ctx.renderer_mapped_draw_buffers
+            && self
+                .mapped_draw_buffers
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        let mut grant = Grant(mapped_draw_buffers.then_some(&self.mapped_draw_buffers));
+        // Only webgpu.h's features, and those mappable draw buffers: Dawn has
+        // more, which a guest never hears of and may not ask for.
+        if let Some(feature) = descriptor.and_then(|descriptor| {
+            descriptor.required_features.iter().find(|&&feature| {
+                FeatureName::from_u32(feature).is_none()
+                    && !(feature == FEATURE_BUFFER_MAP_EXTENDED_USAGES && mapped_draw_buffers)
+            })
         }) {
             return Err(early(&format!(
                 "Required feature {feature:#x} is not supported."
@@ -275,6 +303,23 @@ impl Host {
         }
         native.requiredFeatureCount = features.len();
         native.requiredFeatures = features.as_ptr();
+        // Dawn grants an experimental feature only with its unsafe APIs: the
+        // device that asks for mappable draw buffers gets them, no other one.
+        // Dawn fails the request where the adapter cannot map such buffers.
+        let unsafe_apis = [c"allow_unsafe_apis".as_ptr()];
+        let mut toggles = WGPUDawnTogglesDescriptor {
+            chain: ffi::WGPUChainedStruct {
+                next: native.nextInChain,
+                sType: STYPE_DAWN_TOGGLES_DESCRIPTOR,
+            },
+            enabledToggleCount: unsafe_apis.len(),
+            enabledToggles: unsafe_apis.as_ptr(),
+            disabledToggleCount: 0,
+            disabledToggles: std::ptr::null(),
+        };
+        if mapped_draw_buffers {
+            native.nextInChain = &mut toggles.chain;
+        }
 
         let link = Arc::new(DeviceLink {
             handle: AtomicU32::new(0),
@@ -326,6 +371,8 @@ impl Host {
                 lost_reported: true,
             });
         }
+        // The device has them: keep the grant.
+        grant.0 = None;
         // SAFETY: the new device.
         let queue = unsafe { ffi::wgpuDeviceGetQueue(request.device) };
         let state = Arc::new(DeviceState {

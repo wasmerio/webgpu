@@ -137,6 +137,9 @@ pub(crate) struct Host {
     pub(crate) futures: callbacks::Futures,
     /// Pipelines Dawn compiled, waiting for a guest thread to give them handles.
     pub(crate) pipelines: shim::Pipelines,
+    /// Whether a device of this process has mappable draw buffers (and so
+    /// Dawn's unsafe APIs): the first one to ask, if the embedder allows it.
+    pub(crate) mapped_draw_buffers: AtomicBool,
 }
 
 impl Host {
@@ -156,6 +159,7 @@ impl Host {
             dawn: OnceLock::new(),
             futures: callbacks::Futures::default(),
             pipelines: Default::default(),
+            mapped_draw_buffers: AtomicBool::new(false),
             ctx,
         }
     }

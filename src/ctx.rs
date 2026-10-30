@@ -51,9 +51,21 @@ pub struct WebGpuCtxBuilder {
     event_waker: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(target_arch = "wasm32")]
     canvas_scope: u32,
+    renderer_mapped_draw_buffers: bool,
 }
 
 impl WebGpuCtxBuilder {
+    /// Lets the first device of each guest process that asks for Dawn's
+    /// `BufferMapExtendedUsages` (0x00050013) have it, with the
+    /// `allow_unsafe_apis` toggle Dawn requires for it. For an embedder whose
+    /// guest is its own renderer (a browser engine writing draw data into
+    /// mapped buffers); other guests should not get Dawn's unsafe APIs. Only
+    /// the Dawn host grants it. Off by default.
+    pub fn renderer_mapped_draw_buffers(mut self, allow: bool) -> Self {
+        self.renderer_mapped_draw_buffers = allow;
+        self
+    }
+
     pub fn limits(mut self, limits: WebGpuLimits) -> Self {
         self.limits = limits;
         self
@@ -139,6 +151,7 @@ impl WebGpuCtxBuilder {
                 #[cfg(target_arch = "wasm32")]
                 canvas_scope: self.canvas_scope,
                 stopped: AtomicBool::new(false),
+                renderer_mapped_draw_buffers: self.renderer_mapped_draw_buffers,
             }),
         }
     }
@@ -146,6 +159,12 @@ impl WebGpuCtxBuilder {
 
 pub(crate) struct CtxInner {
     pub(crate) limits: WebGpuLimits,
+    /// WebGpuCtxBuilder::renderer_mapped_draw_buffers.
+    #[cfg_attr(
+        not(all(not(target_arch = "wasm32"), feature = "dawn")),
+        allow(dead_code)
+    )]
+    pub(crate) renderer_mapped_draw_buffers: bool,
     pub(crate) force_fallback_adapter: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) surfaces: Arc<dyn crate::surface::SurfaceProvider>,
@@ -429,6 +448,16 @@ mod tests {
         hooks
             .configure_instance(&module, &mut store.as_store_mut(), &instance, None, state)
             .expect("configures");
+    }
+
+    #[test]
+    fn mappable_draw_buffers_need_the_embedder_to_allow_them() {
+        // They come with Dawn's unsafe APIs: never unless the embedder asked.
+        assert!(!WebGpuCtx::default().inner.renderer_mapped_draw_buffers);
+        let ctx = WebGpuCtx::builder()
+            .renderer_mapped_draw_buffers(true)
+            .build();
+        assert!(ctx.inner.renderer_mapped_draw_buffers);
     }
 
     #[test]
