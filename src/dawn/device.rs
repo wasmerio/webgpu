@@ -3,12 +3,16 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use super::adapter::{AdapterState, standard_features, write_limits};
+use super::callbacks::InFlight;
 use super::dawn_ext::{FEATURE_IMPLICIT_DEVICE_SYNCHRONIZATION, wgpuDeviceInjectError};
 use super::ffi::{self, Kind};
 use super::lower::Lowering;
-use super::{Events, Extra, Host, Native, Record, exclusive, lock, text, view};
+use super::{
+    Events, Extra, Host, Native, PIPELINE_CALLBACKS_WAIT, Record, exclusive, lock, text, view,
+};
 use crate::abi::enums::{CallbackMode, DeviceLostReason, ErrorType, FeatureName, Status};
 use crate::abi::structs::{DeviceDescriptor, Limits};
 use crate::abi::{AbiEnum, Cx, EVENT_DEVICE_LOST, EVENT_UNCAPTURED_ERROR, Handle, OutPtr};
@@ -94,6 +98,8 @@ pub(crate) struct DeviceState {
     /// mappings, exclusively while Dawn destroys the device (which frees
     /// them all).
     pub(crate) access: RwLock<()>,
+    /// Pipelines Dawn is compiling for this device.
+    pub(crate) pipelines: Arc<InFlight>,
 }
 
 // SAFETY: devices are created with implicit device synchronization.
@@ -126,10 +132,38 @@ impl DeviceState {
     /// Destroys the device. Dawn reports the loss through the callback; the
     /// host reports it at once too (once is all the guest hears), so a guest
     /// waiting on the lost future does not depend on Dawn's timing.
-    pub(crate) fn destroy(&self) {
-        let _copies = exclusive(&self.access);
-        // SAFETY: a live device.
-        crate::native::autoreleased(|| unsafe { ffi::wgpuDeviceDestroy(self.raw) });
+    ///
+    /// Dawn destroys a device holding its lock, and waits for the device's
+    /// compilations, whose callbacks take that lock: they finish first. This
+    /// waits for them as long as `wait` (for a guest's destroy, as Dawn would
+    /// have); after that, a thread of its own destroys the device once they
+    /// are done.
+    pub(crate) fn destroy(self: &Arc<Self>, wait: Duration) {
+        {
+            // Also keeps new pipeline requests from starting: they hold it
+            // shared.
+            let _copies = exclusive(&self.access);
+            if self.pipelines.wait(wait) {
+                // SAFETY: a live device.
+                crate::native::autoreleased(|| unsafe { ffi::wgpuDeviceDestroy(self.raw) });
+            } else {
+                let device = Arc::clone(self);
+                let spawned = std::thread::Builder::new()
+                    .name("webgpu-device-destroy".to_owned())
+                    .spawn(move || {
+                        let _copies = exclusive(&device.access);
+                        device.pipelines.wait_all();
+                        // SAFETY: a live device.
+                        crate::native::autoreleased(|| unsafe {
+                            ffi::wgpuDeviceDestroy(device.raw)
+                        });
+                    });
+                if spawned.is_err() {
+                    // Released with its last reference instead.
+                    super::log(|| "device destroy: no thread to finish it".to_owned());
+                }
+            }
+        }
         self.link.on_lost(
             DeviceLostReason::Destroyed.as_u32(),
             "Device was destroyed.".to_owned(),
@@ -297,6 +331,7 @@ impl Host {
             adapter_info: adapter_state.info.clone(),
             queue_handle: Mutex::new(0),
             access: RwLock::new(()),
+            pipelines: Arc::default(),
         });
         self.register_device(&state);
         Ok(state)
@@ -328,7 +363,7 @@ impl Host {
         // lost callback then receives a null device.
         if let Some(state) = &object.device {
             state.link.handle.store(0, Ordering::Release);
-            state.destroy();
+            state.destroy(PIPELINE_CALLBACKS_WAIT);
         }
         true
     }
@@ -343,7 +378,7 @@ impl Host {
 
     pub(crate) fn manual_device_destroy(&self, _cx: &mut Cx<'_>, device: Handle) {
         if let Some(state) = self.device(device) {
-            state.destroy();
+            state.destroy(PIPELINE_CALLBACKS_WAIT);
         }
     }
 

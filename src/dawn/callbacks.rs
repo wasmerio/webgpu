@@ -12,7 +12,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use super::buffer::MapInfo;
 use super::ffi::{self, WGPUStringView};
@@ -302,14 +303,89 @@ pub(crate) struct DonePipelines {
     pub(crate) list: Mutex<Vec<DonePipeline>>,
 }
 
+/// How many of a device's pipeline requests still owe their callback. It
+/// holds no GPU object, so a compiler thread may be the last to let go of it.
+#[derive(Default)]
+pub(crate) struct InFlight {
+    count: Mutex<usize>,
+    settled: Condvar,
+}
+
+impl InFlight {
+    /// A request is about to start: its callback is owed. The caller holds
+    /// the device's `access` shared, so a destroy waits for it.
+    fn start(&self) {
+        *lock(&self.count) += 1;
+    }
+
+    fn called_back(&self) {
+        let mut count = lock(&self.count);
+        *count -= 1;
+        if *count == 0 {
+            self.settled.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> usize {
+        *lock(&self.count)
+    }
+
+    /// Waits until every request's callback has run.
+    pub(crate) fn wait_all(&self) {
+        let count = lock(&self.count);
+        drop(
+            self.settled
+                .wait_while(count, |count| *count > 0)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    /// Waits, for at most `timeout`, until every request's callback has run.
+    /// Whether they all did.
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        let count = lock(&self.count);
+        let (count, _) = self
+            .settled
+            .wait_timeout_while(count, timeout, |count| *count > 0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count == 0
+    }
+}
+
 /// A pending `wgpuDeviceCreate*PipelineAsync`.
 pub(crate) struct PipelineRequest {
-    pub(crate) pending: Pending,
-    pub(crate) event: u32,
-    pub(crate) kind: ffi::Kind,
-    pub(crate) done: Arc<DonePipelines>,
-    pub(crate) device: Arc<DeviceState>,
-    pub(crate) instance: Handle,
+    pending: Pending,
+    event: u32,
+    kind: ffi::Kind,
+    done: Arc<DonePipelines>,
+    device: Arc<DeviceState>,
+    instance: Handle,
+    in_flight: Arc<InFlight>,
+}
+
+impl PipelineRequest {
+    /// The context of a request Dawn is about to start, counted in flight
+    /// until its callback has run.
+    pub(crate) fn new(
+        pending: Pending,
+        event: u32,
+        kind: ffi::Kind,
+        done: &Arc<DonePipelines>,
+        device: Arc<DeviceState>,
+        instance: Handle,
+    ) -> Self {
+        device.pipelines.start();
+        Self {
+            pending,
+            event,
+            kind,
+            in_flight: Arc::clone(&device.pipelines),
+            done: Arc::clone(done),
+            device,
+            instance,
+        }
+    }
 }
 
 pub(crate) unsafe extern "C" fn pipeline(
@@ -321,20 +397,44 @@ pub(crate) unsafe extern "C" fn pipeline(
 ) {
     // SAFETY: the context boxed for this callback.
     let request = unsafe { take::<PipelineRequest>(userdata1) };
-    request.pending.settle();
-    lock(&request.done.list).push(DonePipeline {
-        future: request.pending.future,
-        event: request.event,
-        kind: request.kind,
+    let PipelineRequest {
+        pending,
+        event,
+        kind,
+        done,
+        device,
+        instance,
+        in_flight,
+    } = *request;
+    pending.settle();
+    lock(&done.list).push(DonePipeline {
+        future: pending.future,
+        event,
+        kind,
         status,
         raw,
         // SAFETY: Dawn's view, valid during the callback.
         message: unsafe { text(message) },
-        device: Arc::clone(&request.device),
-        instance: request.instance,
+        device,
+        instance,
     });
+    // Destroying the device, and a host that is going, wait for this
+    // (`DeviceState::destroy`, `Host::drop`). Let go of everything that can
+    // hold a device first: its last reference must not go on this thread,
+    // inside Dawn's task, where releasing the device waits for that task. A
+    // host that gave up waiting has left the list to this callback; another
+    // thread drops it.
+    if let Some(orphan) = Arc::into_inner(done) {
+        // Without a thread to drop it on, it leaks: dropping it here would
+        // wait for this very task.
+        let orphan = std::mem::ManuallyDrop::new(orphan);
+        let _ = std::thread::Builder::new()
+            .name("webgpu-pipelines-release".to_owned())
+            .spawn(move || drop(std::mem::ManuallyDrop::into_inner(orphan)));
+    }
+    in_flight.called_back();
     // Waiting threads look again; the next poll or wait publishes it.
-    request.pending.events.notify_work();
+    pending.events.notify_work();
 }
 
 /// The two pipeline callbacks differ only in the pipeline's C type.

@@ -126,6 +126,33 @@ impl Host {
         });
     }
 
+    /// Starts an asynchronous compute pipeline creation in Dawn.
+    pub(super) fn create_compute_pipeline_async(
+        &self,
+        device: Handle,
+        descriptor: &ComputePipelineDescriptor,
+        future: u64,
+    ) {
+        self.create_pipeline_async(
+            device,
+            descriptor,
+            future,
+            EVENT_CREATE_COMPUTE_PIPELINE,
+            Kind::ComputePipeline,
+            |device, native, userdata| {
+                let info = ffi::WGPUCreateComputePipelineAsyncCallbackInfo {
+                    mode: CallbackMode::AllowSpontaneous.as_u32(),
+                    callback: Some(callbacks::compute_pipeline),
+                    userdata1: userdata,
+                    ..Default::default()
+                };
+                // SAFETY: a live device, a descriptor that outlives the
+                // call; the callback owns its context.
+                unsafe { ffi::wgpuDeviceCreateComputePipelineAsync(device, native, info) }
+            },
+        )
+    }
+
     /// Starts an asynchronous pipeline creation in Dawn.
     fn create_pipeline_async<T: super::lower::Lower>(
         &self,
@@ -155,14 +182,17 @@ impl Host {
                 return;
             }
         };
-        let request = PipelineRequest {
-            pending: Pending::new(&self.events, &self.futures, future),
+        // Counted in flight before Dawn can call back, and not while the
+        // device is being destroyed (`DeviceState::destroy`).
+        let _destroy = super::shared(&state.access);
+        let request = PipelineRequest::new(
+            Pending::new(&self.events, &self.futures, future),
             event,
             kind,
-            done: Arc::clone(&self.pipelines),
-            device: state.clone(),
-            instance: self.instance_of(device),
-        };
+            &self.pipelines,
+            state.clone(),
+            self.instance_of(device),
+        );
         let dawn_future = start(state.raw, native, callbacks::userdata(request));
         self.futures.track(future, dawn_future);
     }
@@ -250,7 +280,7 @@ impl ShimApi for Host {
             Ok(device) => {
                 let handle = self.insert_device(&device, self.instance_of(adapter));
                 if handle == 0 {
-                    device.destroy();
+                    device.destroy(Duration::ZERO);
                 }
                 self.events.push(Record {
                     future,
@@ -348,24 +378,7 @@ impl ShimApi for Host {
                 .read_required::<ComputePipelineDescriptor>(descriptor, "descriptor"),
         )?;
         match descriptor {
-            Ok(descriptor) => self.create_pipeline_async(
-                device,
-                &descriptor,
-                future,
-                EVENT_CREATE_COMPUTE_PIPELINE,
-                Kind::ComputePipeline,
-                |device, native, userdata| {
-                    let info = ffi::WGPUCreateComputePipelineAsyncCallbackInfo {
-                        mode: CallbackMode::AllowSpontaneous.as_u32(),
-                        callback: Some(callbacks::compute_pipeline),
-                        userdata1: userdata,
-                        ..Default::default()
-                    };
-                    // SAFETY: a live device, a descriptor that outlives the
-                    // call; the callback owns its context.
-                    unsafe { ffi::wgpuDeviceCreateComputePipelineAsync(device, native, info) }
-                },
-            ),
+            Ok(descriptor) => self.create_compute_pipeline_async(device, &descriptor, future),
             Err(message) => {
                 self.fail_pipeline_async(EVENT_CREATE_COMPUTE_PIPELINE, future, message)
             }

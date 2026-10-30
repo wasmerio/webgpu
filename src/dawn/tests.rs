@@ -263,3 +263,139 @@ fn a_refused_map_request_does_not_settle_the_pending_one() {
     super::callbacks::settle_map(&map, 3, true);
     assert_eq!(map.lock().unwrap().state, BufferMapState::Mapped);
 }
+
+/// A host whose device is compiling a pipeline Dawn has not finished, and
+/// the device. None without an adapter (CI's macOS runners).
+fn compiling() -> Option<(Host, std::sync::Weak<super::DeviceState>)> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::abi::api::{DeviceApi, GlobalApi};
+    use crate::abi::{Cx, GuestMemory};
+
+    let host = host();
+    let mut store = wasmer::Store::default();
+    let memory = wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false))
+        .expect("a guest memory");
+    let stopped = || false;
+    let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
+    let instance = host.create_instance(&mut cx, None);
+    let Ok(adapter) = host.request_adapter(instance, None) else {
+        eprintln!("no adapter: skipped");
+        return None;
+    };
+    let adapter = host.insert_adapter(adapter, instance);
+    let Ok(state) = host.request_device(adapter, None, 1) else {
+        eprintln!("no device: skipped");
+        return None;
+    };
+    let device = host.insert_device(&state, instance);
+    // A shader no cache has seen, so Dawn is still compiling it below.
+    let salt = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.subsec_nanos());
+    let wgsl = format!(
+        "@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n\
+         @compute @workgroup_size(64)\n\
+         fn main(@builtin(global_invocation_id) id: vec3<u32>) {{\n\
+         \x20   var x = f32(id.x) + f32({salt}u);\n\
+         \x20   for (var i = 0u; i < 60000u; i++) {{ x = sin(x) + 1.0; }}\n\
+         \x20   data[id.x] = x;\n\
+         }}\n"
+    );
+    let module = host.device_create_shader_module(
+        &mut cx,
+        device,
+        &g::ShaderModuleDescriptor {
+            chain: g::Chain {
+                items: vec![g::Chained::ShaderSourceWGSL(g::ShaderSourceWGSL {
+                    code: wgsl,
+                })],
+                links: Vec::new(),
+            },
+            label: String::new(),
+        },
+    );
+    assert_ne!(module, 0, "the shader module was made");
+    host.create_compute_pipeline_async(
+        device,
+        &g::ComputePipelineDescriptor {
+            compute: g::ComputeState {
+                module,
+                entry_point: Some("main".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        2,
+    );
+    if state.pipelines.count() != 1 {
+        eprintln!("the pipeline compiled at once: skipped");
+        return None;
+    }
+    Some((host, Arc::downgrade(&state)))
+}
+
+/// Runs `f` on another thread: whether it returned within 30 s.
+fn returns(f: impl FnOnce() + Send + 'static) -> bool {
+    let (done, returned) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = done.send(());
+    });
+    returned
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .is_ok()
+}
+
+#[test]
+fn a_host_dropped_while_a_pipeline_compiles_lets_go() {
+    let Some((host, device)) = compiling() else {
+        return;
+    };
+    // The guest goes while Dawn compiles: its host must still go, without
+    // waiting for ever on the compiler (or the compiler on it), and the
+    // device with it, not later in the compiler's callback.
+    assert!(returns(move || drop(host)), "the host was dropped");
+    assert!(device.upgrade().is_none(), "the device went with its host");
+}
+
+#[test]
+fn a_device_destroyed_while_a_pipeline_compiles_lets_go() {
+    let Some((host, device)) = compiling() else {
+        return;
+    };
+    // The embedder shuts the context down (`terminate_all`), which destroys
+    // the device, while Dawn compiles: without waiting for it.
+    let host = Arc::new(host);
+    let terminating = Arc::clone(&host);
+    assert!(
+        returns(move || terminating.terminate()),
+        "the context was shut down"
+    );
+    drop(host);
+    // Destroyed, and released, once Dawn is done compiling.
+    let gone = std::time::Instant::now();
+    while device.upgrade().is_some() {
+        assert!(
+            gone.elapsed() < std::time::Duration::from_secs(30),
+            "the device was released"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_guest_destroying_a_device_while_a_pipeline_compiles_lets_go() {
+    let Some((host, device)) = compiling() else {
+        return;
+    };
+    // `wgpuDeviceDestroy`, and a guest's last device release, wait for the
+    // compilation (as Dawn would) and then destroy the device.
+    let state = device.upgrade().expect("the device is alive");
+    assert!(
+        returns(move || state.destroy(super::PIPELINE_CALLBACKS_WAIT)),
+        "the device was destroyed"
+    );
+    assert!(returns(move || drop(host)), "the host was dropped");
+    assert!(device.upgrade().is_none(), "the device went with its host");
+}

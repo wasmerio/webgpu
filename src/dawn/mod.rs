@@ -185,8 +185,10 @@ impl Host {
     /// Stops the process's GPU work: destroys every device and wakes waiters.
     pub(crate) fn terminate(&self) {
         self.terminated.store(true, Ordering::Release);
+        // Killing never waits for the GPU: a device still compiling is
+        // destroyed once it is done (`DeviceState::destroy`).
         for device in self.live_devices() {
-            device.destroy();
+            device.destroy(std::time::Duration::ZERO);
         }
         self.events.wake_all();
     }
@@ -312,16 +314,25 @@ impl HostControl for Host {
     }
 }
 
+/// How long destroying a device, or a host that is going, waits for Dawn to
+/// finish the pipelines it is compiling (`DeviceState::destroy`, `Host::drop`).
+pub(crate) const PIPELINE_CALLBACKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Drop for Host {
     fn drop(&mut self) {
         self.terminated.store(true, Ordering::Release);
-        // Destroy the devices while the table still holds them: Dawn finishes
-        // their work in flight here, such as an async pipeline whose callback
-        // holds the device. Left to the table, the device's last reference
-        // could go in that callback, on Dawn's worker thread, where destroying
-        // it waits for that very task: thread, device and instance would stay.
+        // A pipeline Dawn is still compiling holds its device until its
+        // callback runs, on Dawn's worker thread. Wait for those callbacks,
+        // holding no Dawn lock (they take the device's): each device's last
+        // reference then goes here, with the table, and never in a callback,
+        // where releasing the device would wait for that very task.
+        let deadline = std::time::Instant::now() + PIPELINE_CALLBACKS_WAIT;
         for device in self.live_devices() {
-            device.destroy();
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if !device.pipelines.wait(left) {
+                log(|| "a pipeline still compiling outlived its host".to_owned());
+                break;
+            }
         }
     }
 }

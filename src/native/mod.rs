@@ -105,9 +105,15 @@ pub(crate) struct HostRegistry {
 
 impl HostRegistry {
     pub(crate) fn live(&mut self) -> Vec<Arc<dyn HostControl>> {
+        self.prune();
+        self.all.iter().filter_map(Weak::upgrade).collect()
+    }
+
+    /// Forgets the hosts that are gone, without holding the others: a host
+    /// dropped here would run its `Drop` under the registry's lock.
+    fn prune(&mut self) {
         self.all.retain(|host| host.strong_count() > 0);
         self.by_memory.retain(|_, host| host.strong_count() > 0);
-        self.all.iter().filter_map(Weak::upgrade).collect()
     }
 }
 
@@ -121,7 +127,7 @@ pub(crate) fn host_for_memory<H: HostControl>(
     let shared = memory.ty(store).shared;
     let base = memory.view(store).data_ptr() as usize;
     let mut registry = lock(&ctx.inner.hosts);
-    registry.live();
+    registry.prune();
     if shared
         && base != 0
         && let Some(host) = registry.by_memory.get(&base).and_then(Weak::upgrade)
