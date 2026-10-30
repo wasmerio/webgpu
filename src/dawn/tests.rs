@@ -587,3 +587,89 @@ fn destroying_a_device_again_while_its_callback_is_owed_lets_go() {
     drop(host);
     assert!(released(&device), "the device was released");
 }
+
+/// A host that may hand one of its guest's devices Dawn's mappable draw
+/// buffers, its instance and adapter, and the descriptor a guest asks for
+/// them with. `max_objects` caps its object table. None without an adapter.
+fn mapped_draw_buffers(
+    max_objects: Option<usize>,
+) -> Option<(Host, u32, u32, g::DeviceDescriptor)> {
+    use crate::abi::api::GlobalApi;
+    use crate::abi::{Cx, GuestMemory};
+
+    let mut builder = crate::WebGpuCtx::builder().renderer_mapped_draw_buffers(true);
+    if let Some(max) = max_objects {
+        builder = builder.max_objects(max);
+    }
+    let host = Host::new(Arc::clone(&builder.build().inner));
+    let mut store = wasmer::Store::default();
+    let memory = wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false))
+        .expect("a guest memory");
+    let stopped = || false;
+    let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
+    let instance = host.create_instance(&mut cx, None);
+    let Ok(adapter) = host.request_adapter(instance, None) else {
+        eprintln!("no adapter: skipped");
+        return None;
+    };
+    let adapter = host.insert_adapter(adapter, instance);
+    let descriptor = g::DeviceDescriptor {
+        required_features: vec![super::dawn_ext::FEATURE_BUFFER_MAP_EXTENDED_USAGES],
+        ..g::DeviceDescriptor::default()
+    };
+    Some((host, instance, adapter, descriptor))
+}
+
+#[test]
+fn a_device_the_guest_never_receives_hands_its_mapped_draw_buffers_back() {
+    // Its object table holds the instance and the adapter and no more, so the
+    // device Dawn makes has nowhere to go. The next device may have its grant.
+    let Some((host, instance, adapter, descriptor)) = mapped_draw_buffers(Some(2)) else {
+        return;
+    };
+    let Ok(state) = host.request_device(adapter, Some(&descriptor), 1) else {
+        eprintln!("no device with mappable draw buffers: skipped");
+        return;
+    };
+    assert!(state.mapped_draw_buffers);
+    assert_eq!(host.insert_device(&state, instance), 0, "the table is full");
+    state.destroy(std::time::Duration::ZERO);
+    let again = host
+        .request_device(adapter, Some(&descriptor), 1)
+        .ok()
+        .expect("the grant came back");
+    assert!(again.mapped_draw_buffers);
+    again.destroy(std::time::Duration::ZERO);
+}
+
+#[test]
+fn only_a_device_granted_mapped_draw_buffers_enumerates_them() {
+    let feature = super::dawn_ext::FEATURE_BUFFER_MAP_EXTENDED_USAGES;
+    let Some((host, instance, adapter, descriptor)) = mapped_draw_buffers(None) else {
+        return;
+    };
+    let Ok(state) = host.request_device(adapter, Some(&descriptor), 1) else {
+        eprintln!("no device with mappable draw buffers: skipped");
+        return;
+    };
+    let handle = host.insert_device(&state, instance);
+    assert_ne!(handle, 0);
+    // What the guest is told it has, and what Dawn says, are the same thing.
+    // SAFETY: a live device.
+    assert_ne!(unsafe { ffi::wgpuDeviceHasFeature(state.raw, feature) }, 0);
+    let features = host.device_features(handle).expect("a live device");
+    assert!(features.contains(&feature), "{features:#x?}");
+    state.destroy(std::time::Duration::ZERO);
+    // A device of a host whose embedder never asked has neither.
+    if let Some((plain, plain_state, plain_device, _)) = device() {
+        assert!(!plain_state.mapped_draw_buffers);
+        // SAFETY: a live device.
+        assert_eq!(
+            unsafe { ffi::wgpuDeviceHasFeature(plain_state.raw, feature) },
+            0
+        );
+        let features = plain.device_features(plain_device).expect("a live device");
+        assert!(!features.contains(&feature), "{features:#x?}");
+        plain_state.destroy(std::time::Duration::ZERO);
+    }
+}
