@@ -116,6 +116,10 @@ pub(crate) struct DeviceState {
     /// Pipelines Dawn is compiling for this device, and whether it is being
     /// destroyed.
     pub(crate) pipelines: Arc<InFlight>,
+    /// This device holds the process's grant of mappable draw buffers
+    /// ([`crate::WebGpuCtxBuilder::renderer_mapped_draw_buffers`]), so it has
+    /// Dawn's unsafe APIs and the feature is one its guest may enumerate.
+    pub(crate) mapped_draw_buffers: bool,
 }
 
 // SAFETY: devices are created with implicit device synchronization.
@@ -371,7 +375,8 @@ impl Host {
                 lost_reported: true,
             });
         }
-        // The device has them: keep the grant.
+        // Dawn made the device: the grant stays with it, until the guest is
+        // handed a handle for it or `insert_device` gives the grant back.
         grant.0 = None;
         // SAFETY: the new device.
         let queue = unsafe { ffi::wgpuDeviceGetQueue(request.device) };
@@ -383,6 +388,7 @@ impl Host {
             queue_handle: Mutex::new(0),
             access: RwLock::new(()),
             pipelines: Arc::default(),
+            mapped_draw_buffers,
         });
         self.register_device(&state);
         Ok(state)
@@ -401,6 +407,14 @@ impl Host {
             }),
             instance,
         );
+        if handle == 0 {
+            // The guest never gets this device (the object table is full, and
+            // the caller destroys it): another one may have its grant.
+            if state.mapped_draw_buffers {
+                self.mapped_draw_buffers.store(false, Ordering::Release);
+            }
+            return 0;
+        }
         state.link.handle.store(handle, Ordering::Release);
         handle
     }
@@ -424,7 +438,15 @@ impl Host {
         let mut supported = ffi::WGPUSupportedFeatures::default();
         // SAFETY: a live device and a struct for Dawn to fill.
         unsafe { ffi::wgpuDeviceGetFeatures(state.raw, &mut supported) };
-        Some(standard_features(supported))
+        // A device granted mappable draw buffers may see that feature, which
+        // is not in webgpu.h: it asked for it. Dawn's other extensions stay
+        // hidden, as they are on the adapter.
+        Some(standard_features(
+            supported,
+            state
+                .mapped_draw_buffers
+                .then_some(FEATURE_BUFFER_MAP_EXTENDED_USAGES),
+        ))
     }
 
     pub(crate) fn manual_device_destroy(&self, _cx: &mut Cx<'_>, device: Handle) {

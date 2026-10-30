@@ -76,7 +76,10 @@ pub(crate) fn encode_info(info: &ffi::WGPUAdapterInfo) -> Vec<u8> {
 }
 
 /// The features webgpu.h knows of a feature list Dawn filled in.
-pub(crate) fn standard_features(supported: ffi::WGPUSupportedFeatures) -> Vec<u32> {
+pub(crate) fn standard_features(
+    supported: ffi::WGPUSupportedFeatures,
+    granted: Option<u32>,
+) -> Vec<u32> {
     let mut out = Vec::new();
     if !supported.features.is_null() {
         // SAFETY: `featureCount` values at `features`.
@@ -85,7 +88,9 @@ pub(crate) fn standard_features(supported: ffi::WGPUSupportedFeatures) -> Vec<u3
         out.extend(
             features
                 .iter()
-                .filter(|&&feature| FeatureName::from_u32(feature).is_some())
+                .filter(|&&feature| {
+                    FeatureName::from_u32(feature).is_some() || Some(feature) == granted
+                })
                 .copied(),
         );
     }
@@ -159,6 +164,6 @@ impl Host {
         let mut supported = ffi::WGPUSupportedFeatures::default();
         // SAFETY: a live adapter and a struct for Dawn to fill.
         unsafe { ffi::wgpuAdapterGetFeatures(object.raw.cast(), &mut supported) };
-        Some(standard_features(supported))
+        Some(standard_features(supported, None))
     }
 }
