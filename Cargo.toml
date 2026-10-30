@@ -32,7 +32,7 @@ js = [
 window = ["dep:winit"]
 # The native host on Dawn (Chromium's WebGPU) instead of wgpu. Needs a Dawn
 # build: `make dawn`, or WASMER_WEBGPU_DAWN_DIR (see build.rs, docs/dawn.md).
-dawn = ["dep:cc", "dep:objc2"]
+dawn = ["dep:cc"]
 
 [dependencies]
 anyhow = "1"
@@ -64,9 +64,10 @@ tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 virtual-fs = { version = "0.705", optional = true }
 wasmer-types = { version = "7.5", optional = true }
 
-# The Dawn host makes the CAMetalLayer a window's surface presents to.
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6", optional = true }
+# Autorelease pools for the native hosts' GPU calls; the Dawn host also makes
+# the CAMetalLayer a window's surface presents to.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6"
 
 [build-dependencies]
 cc = { version = "1", optional = true }

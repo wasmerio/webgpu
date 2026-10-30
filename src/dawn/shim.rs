@@ -10,7 +10,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::callbacks::{self, DonePipelines, Pending, PipelineRequest, Simple};
+use super::callbacks::{self, DonePipeline, DonePipelines, Pending, PipelineRequest, Simple};
+use super::dawn_ext::{wgpuDeviceCreateErrorComputePipeline, wgpuDeviceCreateErrorRenderPipeline};
 use super::ffi::{self, Kind};
 use super::instance::{TIMED_WAIT_ANY_MAX_COUNT, wgsl_language_features};
 use super::lower::Lowering;
@@ -71,8 +72,10 @@ impl Host {
     /// their handles.
     fn progress(&self) {
         if let Some(dawn) = self.dawn.get().and_then(Option::as_ref) {
-            // SAFETY: the host's live instance.
-            unsafe { ffi::wgpuInstanceProcessEvents(dawn.0) };
+            // SAFETY: the host's live instance. It ticks every device of the
+            // process, which can submit their work: drained each time, not
+            // when a long wait's import returns.
+            crate::native::autoreleased(|| unsafe { ffi::wgpuInstanceProcessEvents(dawn.0) });
         }
         self.publish_pipelines();
     }
@@ -124,6 +127,33 @@ impl Host {
         });
     }
 
+    /// Starts an asynchronous compute pipeline creation in Dawn.
+    pub(super) fn create_compute_pipeline_async(
+        &self,
+        device: Handle,
+        descriptor: &ComputePipelineDescriptor,
+        future: u64,
+    ) {
+        self.create_pipeline_async(
+            device,
+            descriptor,
+            future,
+            EVENT_CREATE_COMPUTE_PIPELINE,
+            Kind::ComputePipeline,
+            |device, native, userdata| {
+                let info = ffi::WGPUCreateComputePipelineAsyncCallbackInfo {
+                    mode: CallbackMode::AllowSpontaneous.as_u32(),
+                    callback: Some(callbacks::compute_pipeline),
+                    userdata1: userdata,
+                    ..Default::default()
+                };
+                // SAFETY: a live device, a descriptor that outlives the
+                // call; the callback owns its context.
+                unsafe { ffi::wgpuDeviceCreateComputePipelineAsync(device, native, info) }
+            },
+        )
+    }
+
     /// Starts an asynchronous pipeline creation in Dawn.
     fn create_pipeline_async<T: super::lower::Lower>(
         &self,
@@ -153,13 +183,39 @@ impl Host {
                 return;
             }
         };
-        let request = PipelineRequest {
-            pending: Pending::new(&self.events, &self.futures, future),
+        // Counted in flight before Dawn can call back. A device that is being
+        // destroyed compiles nothing new: destroying it waits for these
+        // (`DeviceState::destroy`). As Dawn does on a lost device, the request
+        // succeeds with an invalid pipeline, made without compiling.
+        let Some(request) = PipelineRequest::new(
+            Pending::new(&self.events, &self.futures, future),
             event,
             kind,
-            done: Arc::clone(&self.pipelines),
-            device: state.clone(),
-            instance: self.instance_of(device),
+            &self.pipelines,
+            state.clone(),
+            self.instance_of(device),
+        ) else {
+            let label = super::view("");
+            // SAFETY: a live device and a view of a string; nothing compiles.
+            let raw: *mut std::ffi::c_void = crate::native::autoreleased(|| unsafe {
+                if kind == Kind::ComputePipeline {
+                    wgpuDeviceCreateErrorComputePipeline(state.raw, label).cast()
+                } else {
+                    wgpuDeviceCreateErrorRenderPipeline(state.raw, label).cast()
+                }
+            });
+            lock(&self.pipelines.list).push(DonePipeline {
+                future,
+                event,
+                kind,
+                status: CreatePipelineAsyncStatus::Success.as_u32(),
+                raw,
+                message: String::new(),
+                device: state,
+                instance: self.instance_of(device),
+            });
+            self.events.notify_work();
+            return;
         };
         let dawn_future = start(state.raw, native, callbacks::userdata(request));
         self.futures.track(future, dawn_future);
@@ -248,7 +304,7 @@ impl ShimApi for Host {
             Ok(device) => {
                 let handle = self.insert_device(&device, self.instance_of(adapter));
                 if handle == 0 {
-                    device.destroy();
+                    device.destroy(Duration::ZERO);
                 }
                 self.events.push(Record {
                     future,
@@ -346,24 +402,7 @@ impl ShimApi for Host {
                 .read_required::<ComputePipelineDescriptor>(descriptor, "descriptor"),
         )?;
         match descriptor {
-            Ok(descriptor) => self.create_pipeline_async(
-                device,
-                &descriptor,
-                future,
-                EVENT_CREATE_COMPUTE_PIPELINE,
-                Kind::ComputePipeline,
-                |device, native, userdata| {
-                    let info = ffi::WGPUCreateComputePipelineAsyncCallbackInfo {
-                        mode: CallbackMode::AllowSpontaneous.as_u32(),
-                        callback: Some(callbacks::compute_pipeline),
-                        userdata1: userdata,
-                        ..Default::default()
-                    };
-                    // SAFETY: a live device, a descriptor that outlives the
-                    // call; the callback owns its context.
-                    unsafe { ffi::wgpuDeviceCreateComputePipelineAsync(device, native, info) }
-                },
-            ),
+            Ok(descriptor) => self.create_compute_pipeline_async(device, &descriptor, future),
             Err(message) => {
                 self.fail_pipeline_async(EVENT_CREATE_COMPUTE_PIPELINE, future, message)
             }
@@ -514,14 +553,14 @@ impl ShimApi for Host {
                         })
                         .collect();
                     // SAFETY: the host's live instance and futures it started.
-                    let status = unsafe {
+                    let status = crate::native::autoreleased(|| unsafe {
                         ffi::wgpuInstanceWaitAny(
                             dawn.0,
                             waits.len(),
                             waits.as_mut_ptr(),
                             slice.as_nanos() as u64,
                         )
-                    };
+                    });
                     // Dawn may be unable to wait on this mix of futures at
                     // once (several queues, or a queue's with another kind,
                     // on backends without spontaneous queue events): it says

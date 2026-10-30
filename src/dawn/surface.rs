@@ -98,7 +98,7 @@ impl Drop for SurfaceState {
         // buffer's reference. Not `unconfigure`: the window's Dawn surface
         // may be released already (its `Native` lets go of it first).
         let inner = self.inner.get_mut().unwrap_or_else(|p| p.into_inner());
-        inner.retire();
+        crate::native::autoreleased(|| inner.retire());
     }
 }
 

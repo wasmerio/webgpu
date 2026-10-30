@@ -3,12 +3,16 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use super::adapter::{AdapterState, standard_features, write_limits};
+use super::callbacks::InFlight;
 use super::dawn_ext::{FEATURE_IMPLICIT_DEVICE_SYNCHRONIZATION, wgpuDeviceInjectError};
 use super::ffi::{self, Kind};
 use super::lower::Lowering;
-use super::{Events, Extra, Host, Native, Record, exclusive, lock, text, view};
+use super::{
+    Events, Extra, Host, Native, PIPELINE_CALLBACKS_WAIT, Record, exclusive, lock, text, view,
+};
 use crate::abi::enums::{CallbackMode, DeviceLostReason, ErrorType, FeatureName, Status};
 use crate::abi::structs::{DeviceDescriptor, Limits};
 use crate::abi::{AbiEnum, Cx, EVENT_DEVICE_LOST, EVENT_UNCAPTURED_ERROR, Handle, OutPtr};
@@ -94,6 +98,9 @@ pub(crate) struct DeviceState {
     /// mappings, exclusively while Dawn destroys the device (which frees
     /// them all).
     pub(crate) access: RwLock<()>,
+    /// Pipelines Dawn is compiling for this device, and whether it is being
+    /// destroyed.
+    pub(crate) pipelines: Arc<InFlight>,
 }
 
 // SAFETY: devices are created with implicit device synchronization.
@@ -102,11 +109,12 @@ unsafe impl Sync for DeviceState {}
 
 impl Drop for DeviceState {
     fn drop(&mut self) {
-        // SAFETY: the host's own references.
-        unsafe {
+        // SAFETY: the host's own references. The last one destroys the device,
+        // whose final submission Metal autoreleases (`autoreleased`).
+        crate::native::autoreleased(|| unsafe {
             ffi::wgpuQueueRelease(self.queue);
             ffi::wgpuDeviceRelease(self.raw);
-        }
+        });
     }
 }
 
@@ -125,14 +133,45 @@ impl DeviceState {
     /// Destroys the device. Dawn reports the loss through the callback; the
     /// host reports it at once too (once is all the guest hears), so a guest
     /// waiting on the lost future does not depend on Dawn's timing.
-    pub(crate) fn destroy(&self) {
-        let _copies = exclusive(&self.access);
-        // SAFETY: a live device.
-        unsafe { ffi::wgpuDeviceDestroy(self.raw) };
+    ///
+    /// Dawn destroys a device holding its lock, and waits for the device's
+    /// compilations, whose callbacks take that lock: they finish first. The
+    /// first call stops new compilations, reports the loss, and waits for
+    /// those in flight for as long as `wait` (for a guest's destroy, as Dawn
+    /// would have), holding no lock. Otherwise (a kill waits for nothing) a
+    /// thread of its own destroys the device once they are done. Later calls
+    /// only report the loss.
+    pub(crate) fn destroy(self: &Arc<Self>, wait: Duration) {
+        let first = self.pipelines.close();
         self.link.on_lost(
             DeviceLostReason::Destroyed.as_u32(),
             "Device was destroyed.".to_owned(),
         );
+        if first {
+            if !wait.is_zero() && self.pipelines.wait(wait) {
+                self.destroy_now();
+            } else {
+                let device = Arc::clone(self);
+                let spawned = std::thread::Builder::new()
+                    .name("webgpu-device-destroy".to_owned())
+                    .spawn(move || {
+                        device.pipelines.wait_all();
+                        device.destroy_now();
+                    });
+                if spawned.is_err() {
+                    // Released with its last reference instead.
+                    super::log(|| "device destroy: no thread to finish it".to_owned());
+                }
+            }
+        }
+    }
+
+    /// Destroys the device in Dawn, which frees its mappings: no copy to or
+    /// from one runs meanwhile.
+    fn destroy_now(&self) {
+        let _copies = exclusive(&self.access);
+        // SAFETY: a live device, with no pipeline compiling.
+        crate::native::autoreleased(|| unsafe { ffi::wgpuDeviceDestroy(self.raw) });
     }
 }
 
@@ -296,6 +335,7 @@ impl Host {
             adapter_info: adapter_state.info.clone(),
             queue_handle: Mutex::new(0),
             access: RwLock::new(()),
+            pipelines: Arc::default(),
         });
         self.register_device(&state);
         Ok(state)
@@ -327,7 +367,7 @@ impl Host {
         // lost callback then receives a null device.
         if let Some(state) = &object.device {
             state.link.handle.store(0, Ordering::Release);
-            state.destroy();
+            state.destroy(PIPELINE_CALLBACKS_WAIT);
         }
         true
     }
@@ -342,7 +382,7 @@ impl Host {
 
     pub(crate) fn manual_device_destroy(&self, _cx: &mut Cx<'_>, device: Handle) {
         if let Some(state) = self.device(device) {
-            state.destroy();
+            state.destroy(PIPELINE_CALLBACKS_WAIT);
         }
     }
 

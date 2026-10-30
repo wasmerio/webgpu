@@ -91,7 +91,7 @@ impl Drop for Native {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             // SAFETY: `raw` is a live object of this kind, and this its reference.
-            unsafe { self.kind.release(self.raw) };
+            crate::native::autoreleased(|| unsafe { self.kind.release(self.raw) });
         }
     }
 }
@@ -118,7 +118,7 @@ unsafe impl Sync for DawnInstance {}
 impl Drop for DawnInstance {
     fn drop(&mut self) {
         // SAFETY: the host's own reference.
-        unsafe { ffi::wgpuInstanceRelease(self.0) };
+        crate::native::autoreleased(|| unsafe { ffi::wgpuInstanceRelease(self.0) });
     }
 }
 
@@ -185,8 +185,10 @@ impl Host {
     /// Stops the process's GPU work: destroys every device and wakes waiters.
     pub(crate) fn terminate(&self) {
         self.terminated.store(true, Ordering::Release);
+        // Killing never waits for the GPU: a device still compiling is
+        // destroyed once it is done (`DeviceState::destroy`).
         for device in self.live_devices() {
-            device.destroy();
+            device.destroy(std::time::Duration::ZERO);
         }
         self.events.wake_all();
     }
@@ -312,9 +314,16 @@ impl HostControl for Host {
     }
 }
 
+/// How long a guest's destroy of a device waits for Dawn to finish the
+/// pipelines it is compiling (`DeviceState::destroy`).
+pub(crate) const PIPELINE_CALLBACKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Drop for Host {
     fn drop(&mut self) {
         self.terminated.store(true, Ordering::Release);
+        // A pipeline Dawn is still compiling keeps its device, and the list
+        // of compiled pipelines, until its callback runs; the last callback
+        // drops them on a thread of its own (`callbacks::pipeline`).
     }
 }
 
