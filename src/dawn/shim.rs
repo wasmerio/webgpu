@@ -10,7 +10,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::callbacks::{self, DonePipelines, Pending, PipelineRequest, Simple};
+use super::callbacks::{self, DonePipeline, DonePipelines, Pending, PipelineRequest, Simple};
+use super::dawn_ext::{wgpuDeviceCreateErrorComputePipeline, wgpuDeviceCreateErrorRenderPipeline};
 use super::ffi::{self, Kind};
 use super::instance::{TIMED_WAIT_ANY_MAX_COUNT, wgsl_language_features};
 use super::lower::Lowering;
@@ -182,17 +183,40 @@ impl Host {
                 return;
             }
         };
-        // Counted in flight before Dawn can call back, and not while the
-        // device is being destroyed (`DeviceState::destroy`).
-        let _destroy = super::shared(&state.access);
-        let request = PipelineRequest::new(
+        // Counted in flight before Dawn can call back. A device that is being
+        // destroyed compiles nothing new: destroying it waits for these
+        // (`DeviceState::destroy`). As Dawn does on a lost device, the request
+        // succeeds with an invalid pipeline, made without compiling.
+        let Some(request) = PipelineRequest::new(
             Pending::new(&self.events, &self.futures, future),
             event,
             kind,
             &self.pipelines,
             state.clone(),
             self.instance_of(device),
-        );
+        ) else {
+            let label = super::view("");
+            // SAFETY: a live device and a view of a string; nothing compiles.
+            let raw: *mut std::ffi::c_void = crate::native::autoreleased(|| unsafe {
+                if kind == Kind::ComputePipeline {
+                    wgpuDeviceCreateErrorComputePipeline(state.raw, label).cast()
+                } else {
+                    wgpuDeviceCreateErrorRenderPipeline(state.raw, label).cast()
+                }
+            });
+            lock(&self.pipelines.list).push(DonePipeline {
+                future,
+                event,
+                kind,
+                status: CreatePipelineAsyncStatus::Success.as_u32(),
+                raw,
+                message: String::new(),
+                device: state,
+                instance: self.instance_of(device),
+            });
+            self.events.notify_work();
+            return;
+        };
         let dawn_future = start(state.raw, native, callbacks::userdata(request));
         self.futures.track(future, dawn_future);
     }

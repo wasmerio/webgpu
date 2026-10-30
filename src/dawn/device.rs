@@ -98,7 +98,8 @@ pub(crate) struct DeviceState {
     /// mappings, exclusively while Dawn destroys the device (which frees
     /// them all).
     pub(crate) access: RwLock<()>,
-    /// Pipelines Dawn is compiling for this device.
+    /// Pipelines Dawn is compiling for this device, and whether it is being
+    /// destroyed.
     pub(crate) pipelines: Arc<InFlight>,
 }
 
@@ -134,29 +135,28 @@ impl DeviceState {
     /// waiting on the lost future does not depend on Dawn's timing.
     ///
     /// Dawn destroys a device holding its lock, and waits for the device's
-    /// compilations, whose callbacks take that lock: they finish first. This
-    /// waits for them as long as `wait` (for a guest's destroy, as Dawn would
-    /// have); after that, a thread of its own destroys the device once they
-    /// are done.
+    /// compilations, whose callbacks take that lock: they finish first. The
+    /// first call stops new compilations, reports the loss, and waits for
+    /// those in flight for as long as `wait` (for a guest's destroy, as Dawn
+    /// would have), holding no lock. Otherwise (a kill waits for nothing) a
+    /// thread of its own destroys the device once they are done. Later calls
+    /// only report the loss.
     pub(crate) fn destroy(self: &Arc<Self>, wait: Duration) {
-        {
-            // Also keeps new pipeline requests from starting: they hold it
-            // shared.
-            let _copies = exclusive(&self.access);
-            if self.pipelines.wait(wait) {
-                // SAFETY: a live device.
-                crate::native::autoreleased(|| unsafe { ffi::wgpuDeviceDestroy(self.raw) });
+        let first = self.pipelines.close();
+        self.link.on_lost(
+            DeviceLostReason::Destroyed.as_u32(),
+            "Device was destroyed.".to_owned(),
+        );
+        if first {
+            if !wait.is_zero() && self.pipelines.wait(wait) {
+                self.destroy_now();
             } else {
                 let device = Arc::clone(self);
                 let spawned = std::thread::Builder::new()
                     .name("webgpu-device-destroy".to_owned())
                     .spawn(move || {
-                        let _copies = exclusive(&device.access);
                         device.pipelines.wait_all();
-                        // SAFETY: a live device.
-                        crate::native::autoreleased(|| unsafe {
-                            ffi::wgpuDeviceDestroy(device.raw)
-                        });
+                        device.destroy_now();
                     });
                 if spawned.is_err() {
                     // Released with its last reference instead.
@@ -164,10 +164,14 @@ impl DeviceState {
                 }
             }
         }
-        self.link.on_lost(
-            DeviceLostReason::Destroyed.as_u32(),
-            "Device was destroyed.".to_owned(),
-        );
+    }
+
+    /// Destroys the device in Dawn, which frees its mappings: no copy to or
+    /// from one runs meanwhile.
+    fn destroy_now(&self) {
+        let _copies = exclusive(&self.access);
+        // SAFETY: a live device, with no pipeline compiling.
+        crate::native::autoreleased(|| unsafe { ffi::wgpuDeviceDestroy(self.raw) });
     }
 }
 

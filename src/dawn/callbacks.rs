@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use super::buffer::MapInfo;
 use super::ffi::{self, WGPUStringView};
-use super::{DeviceState, Events, Record, lock, text};
+use super::{DeviceState, Events, Record, lock, log, text};
 use crate::abi::enums::{BufferMapState, CompilationInfoRequestStatus, MapAsyncStatus};
 use crate::abi::{AbiEnum, EVENT_BUFFER_MAP, EVENT_COMPILATION_INFO, Handle};
 
@@ -303,40 +303,58 @@ pub(crate) struct DonePipelines {
     pub(crate) list: Mutex<Vec<DonePipeline>>,
 }
 
-/// How many of a device's pipeline requests still owe their callback. It
-/// holds no GPU object, so a compiler thread may be the last to let go of it.
+/// A device's pipeline requests that still owe their callback, and whether
+/// the device is being destroyed. It holds no GPU object, so a compiler
+/// thread may be the last to let go of it.
 #[derive(Default)]
 pub(crate) struct InFlight {
-    count: Mutex<usize>,
+    state: Mutex<Flight>,
     settled: Condvar,
 }
 
+#[derive(Default)]
+struct Flight {
+    count: usize,
+    closed: bool,
+}
+
 impl InFlight {
-    /// A request is about to start: its callback is owed. The caller holds
-    /// the device's `access` shared, so a destroy waits for it.
-    fn start(&self) {
-        *lock(&self.count) += 1;
+    /// Counts a request that is about to start: its callback is owed. False
+    /// once the device is being destroyed, when nothing new may start.
+    fn start(&self) -> bool {
+        let mut state = lock(&self.state);
+        if state.closed {
+            return false;
+        }
+        state.count += 1;
+        true
+    }
+
+    /// Lets no more requests start. True for the first call only: its caller
+    /// destroys the device.
+    pub(crate) fn close(&self) -> bool {
+        !std::mem::replace(&mut lock(&self.state).closed, true)
     }
 
     fn called_back(&self) {
-        let mut count = lock(&self.count);
-        *count -= 1;
-        if *count == 0 {
+        let mut state = lock(&self.state);
+        state.count -= 1;
+        if state.count == 0 {
             self.settled.notify_all();
         }
     }
 
     #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
-        *lock(&self.count)
+        lock(&self.state).count
     }
 
     /// Waits until every request's callback has run.
     pub(crate) fn wait_all(&self) {
-        let count = lock(&self.count);
+        let state = lock(&self.state);
         drop(
             self.settled
-                .wait_while(count, |count| *count > 0)
+                .wait_while(state, |state| state.count > 0)
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
     }
@@ -344,12 +362,12 @@ impl InFlight {
     /// Waits, for at most `timeout`, until every request's callback has run.
     /// Whether they all did.
     pub(crate) fn wait(&self, timeout: Duration) -> bool {
-        let count = lock(&self.count);
-        let (count, _) = self
+        let state = lock(&self.state);
+        let (state, _) = self
             .settled
-            .wait_timeout_while(count, timeout, |count| *count > 0)
+            .wait_timeout_while(state, timeout, |state| state.count > 0)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *count == 0
+        state.count == 0
     }
 }
 
@@ -366,7 +384,7 @@ pub(crate) struct PipelineRequest {
 
 impl PipelineRequest {
     /// The context of a request Dawn is about to start, counted in flight
-    /// until its callback has run.
+    /// until its callback has run. None if the device is being destroyed.
     pub(crate) fn new(
         pending: Pending,
         event: u32,
@@ -374,9 +392,8 @@ impl PipelineRequest {
         done: &Arc<DonePipelines>,
         device: Arc<DeviceState>,
         instance: Handle,
-    ) -> Self {
-        device.pipelines.start();
-        Self {
+    ) -> Option<Self> {
+        device.pipelines.start().then(|| Self {
             pending,
             event,
             kind,
@@ -384,7 +401,7 @@ impl PipelineRequest {
             done: Arc::clone(done),
             device,
             instance,
-        }
+        })
     }
 }
 
@@ -418,19 +435,21 @@ pub(crate) unsafe extern "C" fn pipeline(
         device,
         instance,
     });
-    // Destroying the device, and a host that is going, wait for this
-    // (`DeviceState::destroy`, `Host::drop`). Let go of everything that can
-    // hold a device first: its last reference must not go on this thread,
-    // inside Dawn's task, where releasing the device waits for that task. A
-    // host that gave up waiting has left the list to this callback; another
-    // thread drops it.
+    // Destroying the device waits for this (`DeviceState::destroy`). Let go
+    // of everything that can hold a device first: its last reference must
+    // not go on this thread, inside Dawn's task, where releasing the device
+    // waits for that task. A host that went has left the list to this
+    // callback; another thread drops it.
     if let Some(orphan) = Arc::into_inner(done) {
         // Without a thread to drop it on, it leaks: dropping it here would
         // wait for this very task.
         let orphan = std::mem::ManuallyDrop::new(orphan);
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("webgpu-pipelines-release".to_owned())
             .spawn(move || drop(std::mem::ManuallyDrop::into_inner(orphan)));
+        if spawned.is_err() {
+            log(|| "pipeline callback: no thread to release the host's pipelines".to_owned());
+        }
     }
     in_flight.called_back();
     // Waiting threads look again; the next poll or wait publishes it.

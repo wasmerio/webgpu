@@ -264,12 +264,10 @@ fn a_refused_map_request_does_not_settle_the_pending_one() {
     assert_eq!(map.lock().unwrap().state, BufferMapState::Mapped);
 }
 
-/// A host whose device is compiling a pipeline Dawn has not finished, and
-/// the device. None without an adapter (CI's macOS runners).
-fn compiling() -> Option<(Host, std::sync::Weak<super::DeviceState>)> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use crate::abi::api::{DeviceApi, GlobalApi};
+/// A host with a device, the device, and its instance. None without an
+/// adapter (CI's macOS runners).
+fn device() -> Option<(Host, Arc<super::DeviceState>, u32, u32)> {
+    use crate::abi::api::GlobalApi;
     use crate::abi::{Cx, GuestMemory};
 
     let host = host();
@@ -289,6 +287,23 @@ fn compiling() -> Option<(Host, std::sync::Weak<super::DeviceState>)> {
         return None;
     };
     let device = host.insert_device(&state, instance);
+    Some((host, state, device, instance))
+}
+
+/// A host whose device is compiling a pipeline Dawn has not finished, and
+/// the device. None without an adapter.
+fn compiling() -> Option<(Host, std::sync::Weak<super::DeviceState>)> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::abi::api::DeviceApi;
+    use crate::abi::{Cx, GuestMemory};
+
+    let (host, state, device, _) = device()?;
+    let mut store = wasmer::Store::default();
+    let memory = wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false))
+        .expect("a guest memory");
+    let stopped = || false;
+    let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
     // A shader no cache has seen, so Dawn is still compiling it below.
     let salt = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -335,16 +350,28 @@ fn compiling() -> Option<(Host, std::sync::Weak<super::DeviceState>)> {
     Some((host, Arc::downgrade(&state)))
 }
 
-/// Runs `f` on another thread: whether it returned within 30 s.
-fn returns(f: impl FnOnce() + Send + 'static) -> bool {
+/// Runs `f` on another thread: whether it returned within `seconds`.
+fn returns(seconds: u64, f: impl FnOnce() + Send + 'static) -> bool {
     let (done, returned) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         f();
         let _ = done.send(());
     });
     returned
-        .recv_timeout(std::time::Duration::from_secs(30))
+        .recv_timeout(std::time::Duration::from_secs(seconds))
         .is_ok()
+}
+
+/// Whether the device was released within 30 s.
+fn released(device: &std::sync::Weak<super::DeviceState>) -> bool {
+    let started = std::time::Instant::now();
+    while device.strong_count() > 0 {
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
 }
 
 #[test]
@@ -352,11 +379,11 @@ fn a_host_dropped_while_a_pipeline_compiles_lets_go() {
     let Some((host, device)) = compiling() else {
         return;
     };
-    // The guest goes while Dawn compiles: its host must still go, without
-    // waiting for ever on the compiler (or the compiler on it), and the
-    // device with it, not later in the compiler's callback.
-    assert!(returns(move || drop(host)), "the host was dropped");
-    assert!(device.upgrade().is_none(), "the device went with its host");
+    // The guest goes while Dawn compiles: its host goes at once, without
+    // waiting on the compiler (or the compiler on it), and the device once
+    // the compiler is done, on a thread of its own.
+    assert!(returns(30, move || drop(host)), "the host was dropped");
+    assert!(released(&device), "the device was released");
 }
 
 #[test]
@@ -369,19 +396,11 @@ fn a_device_destroyed_while_a_pipeline_compiles_lets_go() {
     let host = Arc::new(host);
     let terminating = Arc::clone(&host);
     assert!(
-        returns(move || terminating.terminate()),
+        returns(30, move || terminating.terminate()),
         "the context was shut down"
     );
     drop(host);
-    // Destroyed, and released, once Dawn is done compiling.
-    let gone = std::time::Instant::now();
-    while device.upgrade().is_some() {
-        assert!(
-            gone.elapsed() < std::time::Duration::from_secs(30),
-            "the device was released"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    assert!(released(&device), "the device was released");
 }
 
 #[test]
@@ -393,9 +412,111 @@ fn a_guest_destroying_a_device_while_a_pipeline_compiles_lets_go() {
     // compilation (as Dawn would) and then destroy the device.
     let state = device.upgrade().expect("the device is alive");
     assert!(
-        returns(move || state.destroy(super::PIPELINE_CALLBACKS_WAIT)),
+        returns(30, move || state.destroy(super::PIPELINE_CALLBACKS_WAIT)),
         "the device was destroyed"
     );
-    assert!(returns(move || drop(host)), "the host was dropped");
-    assert!(device.upgrade().is_none(), "the device went with its host");
+    drop(host);
+    assert!(released(&device), "the device was released");
+}
+
+#[test]
+fn destroying_a_device_again_while_its_callback_is_owed_lets_go() {
+    use super::callbacks::{self, Pending, PipelineRequest};
+    use crate::abi::enums::CreatePipelineAsyncStatus;
+    use crate::abi::{AbiEnum, EVENT_CREATE_COMPUTE_PIPELINE};
+
+    let Some((host, state, device, instance)) = device() else {
+        return;
+    };
+    let host = Arc::new(host);
+    let request = |future| {
+        PipelineRequest::new(
+            Pending::new(&host.events, &host.futures, future),
+            EVENT_CREATE_COMPUTE_PIPELINE,
+            Kind::ComputePipeline,
+            &host.pipelines,
+            Arc::clone(&state),
+            instance,
+        )
+    };
+    // A request whose callback Dawn owes, held here instead of compiling.
+    let owed = callbacks::userdata(request(2).expect("the device takes requests"));
+    // The embedder shuts the context down, twice, and the guest destroys the
+    // device: none of them waits for the callback.
+    for _ in 0..2 {
+        let terminating = Arc::clone(&host);
+        assert!(
+            returns(5, move || terminating.terminate()),
+            "the context was shut down"
+        );
+    }
+    let destroying = Arc::clone(&state);
+    assert!(
+        returns(5, move || destroying
+            .destroy(super::PIPELINE_CALLBACKS_WAIT)),
+        "the device was destroyed again"
+    );
+    // Nothing new compiles meanwhile: as on a lost device, a request
+    // succeeds with an invalid pipeline.
+    assert!(
+        request(3).is_none(),
+        "a request on a device being destroyed"
+    );
+    let module = {
+        use crate::abi::api::DeviceApi;
+        use crate::abi::{Cx, GuestMemory};
+
+        let mut store = wasmer::Store::default();
+        let memory = wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false))
+            .expect("a guest memory");
+        let stopped = || false;
+        let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
+        host.device_create_shader_module(
+            &mut cx,
+            device,
+            &g::ShaderModuleDescriptor {
+                chain: g::Chain {
+                    items: vec![g::Chained::ShaderSourceWGSL(g::ShaderSourceWGSL {
+                        code: "@compute @workgroup_size(1) fn main() {}".to_owned(),
+                    })],
+                    links: Vec::new(),
+                },
+                label: String::new(),
+            },
+        )
+    };
+    host.create_compute_pipeline_async(
+        device,
+        &g::ComputePipelineDescriptor {
+            compute: g::ComputeState {
+                module,
+                entry_point: Some("main".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        4,
+    );
+    assert_eq!(state.pipelines.count(), 1, "nothing new compiles");
+    {
+        let done = super::lock(&host.pipelines.list);
+        assert_eq!(done.len(), 1, "the request was answered");
+        assert_eq!(done[0].status, CreatePipelineAsyncStatus::Success.as_u32());
+        assert!(!done[0].raw.is_null(), "with an invalid pipeline");
+    }
+    // Dawn calls back: the device is destroyed, and released with its host.
+    // SAFETY: the context boxed for this callback, and a view of a string.
+    unsafe {
+        callbacks::compute_pipeline(
+            CreatePipelineAsyncStatus::CallbackCancelled.as_u32(),
+            std::ptr::null_mut(),
+            super::view(""),
+            owed,
+            std::ptr::null_mut(),
+        )
+    };
+    let device = Arc::downgrade(&state);
+    drop(state);
+    drop(host);
+    assert!(released(&device), "the device was released");
 }

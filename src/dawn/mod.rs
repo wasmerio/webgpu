@@ -314,26 +314,16 @@ impl HostControl for Host {
     }
 }
 
-/// How long destroying a device, or a host that is going, waits for Dawn to
-/// finish the pipelines it is compiling (`DeviceState::destroy`, `Host::drop`).
+/// How long a guest's destroy of a device waits for Dawn to finish the
+/// pipelines it is compiling (`DeviceState::destroy`).
 pub(crate) const PIPELINE_CALLBACKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Drop for Host {
     fn drop(&mut self) {
         self.terminated.store(true, Ordering::Release);
-        // A pipeline Dawn is still compiling holds its device until its
-        // callback runs, on Dawn's worker thread. Wait for those callbacks,
-        // holding no Dawn lock (they take the device's): each device's last
-        // reference then goes here, with the table, and never in a callback,
-        // where releasing the device would wait for that very task.
-        let deadline = std::time::Instant::now() + PIPELINE_CALLBACKS_WAIT;
-        for device in self.live_devices() {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if !device.pipelines.wait(left) {
-                log(|| "a pipeline still compiling outlived its host".to_owned());
-                break;
-            }
-        }
+        // A pipeline Dawn is still compiling keeps its device, and the list
+        // of compiled pipelines, until its callback runs; the last callback
+        // drops them on a thread of its own (`callbacks::pipeline`).
     }
 }
 

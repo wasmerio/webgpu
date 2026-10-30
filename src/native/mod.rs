@@ -37,22 +37,7 @@ pub(crate) const DEFAULT_MAX_PENDING_EVENTS: usize = 4096;
 /// an import that can tick a device: releases, destroys and waits.
 #[cfg(target_vendor = "apple")]
 pub(crate) fn autoreleased<R>(f: impl FnOnce() -> R) -> R {
-    use std::ffi::c_void;
-    #[link(name = "objc")]
-    unsafe extern "C" {
-        fn objc_autoreleasePoolPush() -> *mut c_void;
-        fn objc_autoreleasePoolPop(pool: *mut c_void);
-    }
-    struct Pool(*mut c_void);
-    impl Drop for Pool {
-        fn drop(&mut self) {
-            // SAFETY: the pool this thread pushed last, still open.
-            unsafe { objc_autoreleasePoolPop(self.0) };
-        }
-    }
-    // SAFETY: pushes a pool on this thread; `Pool` pops it, unwinding too.
-    let _pool = Pool(unsafe { objc_autoreleasePoolPush() });
-    f()
+    objc2::rc::autoreleasepool(|_| f())
 }
 
 /// Elsewhere nothing is autoreleased.

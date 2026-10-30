@@ -3,7 +3,9 @@
 
 #![allow(non_snake_case)]
 
-use super::ffi::{WGPUDevice, WGPUErrorType, WGPUStringView};
+use super::ffi::{
+    WGPUComputePipeline, WGPUDevice, WGPUErrorType, WGPURenderPipeline, WGPUStringView,
+};
 
 /// `WGPUFeatureName_ImplicitDeviceSynchronization`: makes a device safe to
 /// use from several threads at once, as a guest's threads do.
@@ -18,4 +20,15 @@ unsafe extern "C" {
         ty: WGPUErrorType,
         message: WGPUStringView,
     );
+
+    /// An invalid pipeline, made without compiling anything: what Dawn's
+    /// asynchronous creation gives on a lost device.
+    pub(crate) fn wgpuDeviceCreateErrorComputePipeline(
+        device: WGPUDevice,
+        label: WGPUStringView,
+    ) -> WGPUComputePipeline;
+    pub(crate) fn wgpuDeviceCreateErrorRenderPipeline(
+        device: WGPUDevice,
+        label: WGPUStringView,
+    ) -> WGPURenderPipeline;
 }
