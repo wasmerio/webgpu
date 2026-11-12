@@ -1,5 +1,5 @@
-# Everyday tasks. Nothing here is needed to use the crate from Rust: cargo
-# builds it. The guest library and the test programs need wasixcc
+# Everyday tasks. The default native build needs a Dawn installation.
+# The guest library and the test programs need wasixcc
 # (https://github.com/wasix-org/wasixcc); the browser fixture needs the
 # wasm32-unknown-unknown target and the wasm-bindgen CLI of Cargo.lock's version.
 
@@ -15,7 +15,7 @@ EXAMPLES := $(patsubst examples/%.c,examples/out/%.wasm,$(wildcard examples/*.c)
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 DIST := dist/wasmer-webgpu-guest-$(VERSION)
 
-.PHONY: all guest programs browser-fixture examples dist gen check fmt lint lint-dawn check-web test test-native test-dawn test-browser dawn clean
+.PHONY: all guest programs browser-fixture examples dist gen check fmt lint lint-dawn check-web test test-native test-dawn test-wgpu test-browser dawn clean
 
 all: guest examples
 
@@ -58,28 +58,28 @@ check: lint check-web
 fmt:
 	$(CARGO) fmt
 
+## Lint the wgpu and browser builds without a Dawn installation.
 lint:
-	$(CARGO) clippy --features cli,window --all-targets -- -D warnings
+	$(CARGO) clippy --no-default-features --features cli,window,wgpu --all-targets -- -D warnings
 	$(CARGO) clippy --target wasm32-unknown-unknown --features js --example runtime_hooks -- -D warnings
 
-## The same with the native host on Dawn (needs `make dawn` first).
+## Lint the default native build (needs `make dawn` first).
 lint-dawn:
-	$(CARGO) clippy --features cli,window,dawn --all-targets -- -D warnings
+	$(CARGO) clippy --features cli,window --all-targets -- -D warnings
 
 ## The browser half of the crate, as the Wasmer SDK compiles it.
 check-web:
 	$(CARGO) check --target wasm32-unknown-unknown --no-default-features --features js,wasix
 
-test: test-native
+test test-native: test-dawn
 
 ## Unit tests, the ABI sweep, the conformance programs and the embedder tests.
-## WEBGPU_TEST_FALLBACK_ADAPTER=1 runs them on a software adapter (empty or 0: off).
-test-native: programs
+test-dawn: programs dawn
 	$(CARGO) test --features cli
 
-## The same suite on the Dawn host.
-test-dawn: programs dawn
-	$(CARGO) test --features cli,dawn
+## The same suite on wgpu. WEBGPU_TEST_FALLBACK_ADAPTER=1 selects a software adapter.
+test-wgpu: programs
+	$(CARGO) test --no-default-features --features cli,wgpu
 
 ## Dawn for the `dawn` feature, at the pinned revision: third_party/dawn/install.
 ## Quick when that revision is installed already (the script checks).

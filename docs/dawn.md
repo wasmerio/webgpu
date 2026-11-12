@@ -1,10 +1,10 @@
 # The Dawn host
 
-With the `dawn` feature, the native host runs on [Dawn], Chromium's WebGPU
-implementation, instead of [wgpu]. Guests do not change: they import the same
-`wasmer_webgpu_v0` functions and link the same `libwebgpu.a`.
+The default native host runs on [Dawn], Chromium's WebGPU implementation.
+Guests use the same `wasmer_webgpu_v0` imports and `libwebgpu.a` with Dawn
+and [wgpu].
 
-## Why a second native host
+## Why Dawn
 
 - **It is `webgpu.h`.** Dawn implements the C API itself, at the
   webgpu-headers revision `spec/` pins. The host forwards a call to the C
@@ -21,14 +21,14 @@ implementation, instead of [wgpu]. Guests do not change: they import the same
   Each extra render pass cost about 22 µs on Dawn and 70 µs on wgpu, most of
   it the kernel submitting command buffers.
 
-wgpu stays the default. It builds with cargo alone, and runs where Dawn has
-not been built.
+wgpu builds with Cargo alone. Select it with
+`cargo build --no-default-features --features wgpu`.
 
 ## Building
 
 ```sh
 make dawn                         # the pinned Dawn, into third_party/dawn/install
-cargo build --features dawn       # or: make test-dawn
+cargo build                       # or: make test
 ```
 
 `scripts/build-dawn.sh` fetches the revision it pins, checks that its

@@ -9,7 +9,7 @@
 //     // instantiate with { [IMPORT_MODULE]: host.imports, ... }, then:
 //     host.setMemory(memory);
 //
-// It mirrors the native host (src/host/*.rs) wherever a browser allows:
+// It mirrors the wgpu host (src/wgpu/*.rs) wherever a browser allows:
 //
 //  - The host never calls into the guest. Asynchronous work completes as
 //    event records the guest shim collects with `wasmer_wgpu_poll` and
@@ -80,7 +80,7 @@ const MAX_TIMER_MS = 0x7fff_ffff;
 /** How often a suspended guest's host asks the embedder whether to stop. */
 const TERMINATION_POLL_MS = 50;
 
-// Layout of an event record (src/host/events.rs): a 32-byte header, then the
+// Layout of an event record (src/native/events.rs): a 32-byte header, then the
 // message and the extra payload, each padded to 8 bytes.
 const RECORD = { future: 0, kind: 8, status: 12, handle: 16, aux: 20, messageLength: 24, extraLength: 28, size: 32 };
 
@@ -330,7 +330,7 @@ const INDEX_BITS = 24;
 const INDEX_MASK = (1 << INDEX_BITS) - 1;
 
 /**
- * The guest's opaque `WGPU*` values and what they refer to (src/host/table.rs).
+ * The guest's opaque `WGPU*` values and what they refer to (src/wgpu/table.rs).
  * A handle is a slot index plus the slot's generation, so a stale handle is
  * detected instead of aliasing the slot's next occupant.
  */
@@ -429,7 +429,7 @@ function encodeRecord({ future = 0n, kind, status = 0, handle = 0, aux = 0, mess
 
 /**
  * Completed asynchronous work, waiting for the guest to collect it
- * (src/host/events.rs).
+ * (src/native/events.rs).
  */
 function eventQueue(maxPending, wakeOwner) {
   const ready = [];
@@ -1383,7 +1383,7 @@ export function createWebGpuHost({
 
   /**
    * Serializes adapter info for the shim, which owns the strings it hands
-   * out (src/host/adapter.rs):
+   * out (src/wgpu/adapter.rs):
    *
    *     u32 backendType, adapterType, vendorID, deviceID, subgroupMinSize, subgroupMaxSize;
    *     u32 vendorLength, architectureLength, deviceLength, descriptionLength;
@@ -1762,7 +1762,7 @@ export function createWebGpuHost({
 
   /**
    * The messages of a compilation info, as the event record's extra payload
-   * (src/host/shader.rs):
+   * (src/wgpu/shader.rs):
    *
    *     u32 count; u32 reserved;
    *     per message:
@@ -3012,7 +3012,7 @@ export function createWebGpuHost({
     },
 
     /**
-     * Serialized `WGPUSurfaceCapabilities` (src/host/surface.rs):
+     * Serialized `WGPUSurfaceCapabilities` (src/wgpu/surface.rs):
      *
      *     u64 usages; u32 formatCount, presentModeCount, alphaModeCount, reserved;
      *     u32 formats[]; u32 presentModes[]; u32 alphaModes[];

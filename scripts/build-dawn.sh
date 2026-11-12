@@ -4,7 +4,7 @@
 #
 #   scripts/build-dawn.sh [prefix]    # default: third_party/dawn/install
 #
-# Then: cargo build --features dawn (or set WASMER_WEBGPU_DAWN_DIR=prefix).
+# Then run cargo build. Set WASMER_WEBGPU_DAWN_DIR=prefix for a custom prefix.
 #
 # Needs git, cmake, ninja and a C++20 compiler; Dawn fetches the rest of its
 # dependencies itself. DAWN_SOURCE and DAWN_BUILD override where the checkout

@@ -8,7 +8,7 @@ it:
 
 | Host | GPU backend | Surfaces present to |
 | --- | --- | --- |
-| `wasmer run` and Rust embedders | [wgpu] (Metal, Vulkan, D3D12), or [Dawn] with the `dawn` feature | a window, or a headless target |
+| `wasmer run` and Rust embedders | [Dawn] by default, or [wgpu] with `--no-default-features --features wgpu` | a window, or a headless target |
 | A browser, through the [Wasmer SDK] | the page's `navigator.gpu` | a canvas of the page |
 
 The program is the same binary in every case. It uses the header exactly as
@@ -29,6 +29,7 @@ You need [wasixcc] for the guest side and a Rust toolchain for the host.
 ```sh
 make guest      # lib/wasm32-wasix/libwebgpu.a
 make examples   # examples/out/triangle.wasm
+make dawn       # install the pinned Dawn build for the native host
 cargo run --features cli,window --bin webgpu_wasmer -- --window examples/out/triangle.wasm
 ```
 
@@ -142,8 +143,8 @@ resize handling and device-loss handling a real one needs.
 ```
 guest (wasm32-wasix)                         host
 +--------------------------+   imports   +--------------------------------+
-| app.c  -> webgpu.h       |  wasmer_    | native: src/host/*.rs on wgpu, |
-|                          |             |   or src/dawn/*.rs on Dawn     |
+| app.c  -> webgpu.h       |  wasmer_    | native: src/dawn/*.rs on Dawn, |
+|                          |             |   or src/wgpu/*.rs on wgpu     |
 | libwebgpu.a              |  webgpu_v0  | browser: js/webgpu_host.js on  |
 |   callbacks, futures,    | ----------> |          navigator.gpu         |
 |   mapped ranges, memory  |             | handles, validation, limits    |
@@ -173,7 +174,7 @@ browser cannot do.
 | `codegen/` | The generator (`python3 codegen/gen.py`, `--check` in CI) |
 | `include/` | What guests compile against: `webgpu/webgpu.h` (unmodified) and `webgpu/webgpu_wasix.h` |
 | `guest/` | Sources of `libwebgpu.a` |
-| `src/` | The `wasmer-webgpu` crate: embedder API, native hosts (`host/` on wgpu, `dawn/` on Dawn, `native/` shared), browser glue |
+| `src/` | The `wasmer-webgpu` crate: embedder API, native hosts (`dawn/`, `wgpu/`, and shared code in `native/`), browser glue |
 | `scripts/` | `build-dawn.sh`: the Dawn the `dawn` feature links |
 | `js/` | The browser host |
 | `examples/` | Programs to start from |
@@ -183,8 +184,8 @@ browser cannot do.
 ## Testing
 
 ```sh
-make test           # native: unit tests, ABI sweep, conformance programs, embedder tests
-make test-dawn      # the same on the Dawn host (builds Dawn first, once)
+make test           # Dawn: unit tests, ABI sweep, conformance programs, embedder tests
+make test-wgpu      # the same suite on wgpu
 make test-browser   # the same programs in the installed Chrome, and the runtime hooks built for it
 make check          # generated files up to date, formatting, lints, wasm32 build
 ```
@@ -225,9 +226,14 @@ browser cannot do comes back as its validation error. External textures are
 the exception: neither host provides them yet. A guest's threads cannot share
 GPU objects there, and a guest needs JSPI.
 
-**Natively** the backend is wgpu by default, which does not implement all of
-WebGPU. Where it cannot do what a program asked, the program gets a
-validation error or an absent feature:
+**Natively**, [Dawn] is the default backend. It implements `webgpu.h` itself,
+and the host forwards most calls unchanged. It needs a Dawn build (`make dawn`
+or `WASMER_WEBGPU_DAWN_DIR`). See [docs/dawn.md](docs/dawn.md) for build details.
+
+**With wgpu**, build with `--no-default-features --features wgpu`. In an
+embedding crate, set `default-features = false` and enable `wgpu` on the
+`wasmer-webgpu` dependency. Dawn takes precedence if both features are enabled.
+The wgpu backend has several limitations.
 
 - Shaders are WGSL, as in a browser. A SPIR-V source is refused.
 - External textures, the `Snorm10_10_10_2` vertex format, compatibility mode,
@@ -237,13 +243,8 @@ validation error or an absent feature:
 - `wgpuCommandEncoderWriteTimestamp` needs an adapter that can write
   timestamps outside a pass. (A browser needs an experimental flag for it.)
 
-A label given to an object after it was created, and the queue's label, are
-accepted natively and go nowhere: wgpu takes a label at creation only.
-
-**With the `dawn` feature** the native backend is [Dawn], Chromium's WebGPU,
-which implements `webgpu.h` itself: the host forwards most calls unchanged,
-and a frame costs noticeably less CPU. It needs a Dawn build (`make dawn`).
-[docs/dawn.md](docs/dawn.md) explains how it is made and what differs.
+wgpu accepts object labels at creation. Later label updates and the queue's
+label have no effect.
 
 Window input (keyboard, pointer) is outside `webgpu.h` and not provided.
 

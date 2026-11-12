@@ -8,7 +8,7 @@ repository = "https://github.com/wasmerio/webgpu"
 exclude = ["tests/programs/out", "tests/browser/node_modules", "tests/browser/out", "examples/out", "lib", "dist"]
 
 [features]
-default = []
+default = ["dawn"]
 # Implements the WASIX runtime's `InstantiationHook` for `WebGpuRuntimeHooks`.
 wasix = ["dep:wasmer-wasix"]
 # Standalone runner (`webgpu_wasmer`) and the helpers the manifest tests use.
@@ -19,8 +19,7 @@ cli = [
   "dep:wasmer-types",
 ]
 # Uses the JavaScript realm's `navigator.gpu` when this crate is compiled as part
-# of a wasm32-unknown-unknown wasm-bindgen module. Inert on native targets, where
-# the wgpu backend is always the implementation.
+# of a wasm32-unknown-unknown wasm-bindgen module. Inert on native targets.
 js = [
   "dep:js-sys",
   "dep:wasm-bindgen",
@@ -30,9 +29,11 @@ js = [
 ]
 # Opens host windows for guest surfaces (native only).
 window = ["dep:winit"]
-# The native host on Dawn (Chromium's WebGPU) instead of wgpu. Needs a Dawn
+# The default native host on Dawn (Chromium's WebGPU). Needs a Dawn
 # build: `make dawn`, or WASMER_WEBGPU_DAWN_DIR (see build.rs, docs/dawn.md).
 dawn = ["dep:cc"]
+# The alternate native host. Select with --no-default-features --features wgpu.
+wgpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]
 anyhow = "1"
@@ -49,7 +50,7 @@ wasmer-wasix = { version = "0.705", default-features = false, features = ["sys"]
 # Not wgpu 30 yet: it requires js-sys 0.3.104 (wasm-bindgen 0.2.127), and a
 # lockfile records that even where wgpu is never built for the web. The Wasmer
 # SDK shares its lockfile with this crate and pins wasm-bindgen 0.2.126.
-wgpu = { version = "29.0.4", default-features = false, features = [
+wgpu = { version = "29.0.4", default-features = false, optional = true, features = [
   "std",
   "parking_lot",
   "wgsl",
@@ -57,7 +58,7 @@ wgpu = { version = "29.0.4", default-features = false, features = [
   "vulkan",
   "dx12",
 ] }
-pollster = "0.4"
+pollster = { version = "0.4", optional = true }
 raw-window-handle = "0.6"
 winit = { version = "0.30", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }

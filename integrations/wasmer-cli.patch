@@ -27,7 +27,7 @@ index 43f7c209235..e5f55bab086 100644
  headless-minimal = ["headless", "disable-all-logging"]
  telemetry = []
  napi-v8 = ["dep:wasmer-napi", "wasmer-napi/wasix"]
-+# WebGPU (webgpu.h) for WASIX guests, running on wgpu.
++# WebGPU (webgpu.h) for WASIX guests, using the default native backend.
 +webgpu = ["dep:wasmer-webgpu", "wasmer-webgpu/wasix"]
 +# Shows the surfaces WebGPU guests present to in windows.
 +webgpu-window = ["webgpu", "wasmer-webgpu/window"]

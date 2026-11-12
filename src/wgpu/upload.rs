@@ -906,9 +906,13 @@ mod native_gpu_tests {
     }
 }
 
-/// What staging costs and saves, on the GPU to measure:
-/// `WEBGPU_MEASURE=1 cargo test --release --features cli --lib upload::measure
-/// -- --ignored --nocapture` (`WGPU_BACKEND=vulkan` on Linux for Vulkan).
+/// Measures staging on the selected GPU (`WGPU_BACKEND=vulkan` on Linux for Vulkan).
+///
+/// ```sh
+/// WEBGPU_MEASURE=1 cargo test --release --no-default-features --features cli,wgpu \
+///   --lib upload::measure -- --ignored --nocapture
+/// ```
+///
 /// Without `WEBGPU_MEASURE` it does nothing, so that running every ignored
 /// test (the GPU tests) doesn't run it.
 #[cfg(test)]
