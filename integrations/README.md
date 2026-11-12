@@ -17,6 +17,7 @@ Made against wasmerio/wasmer at `0df5d2ee6c6` (7.4.2).
 
    ```sh
    git apply lib/webgpu/integrations/wasmer-cli.patch
+   make -C lib/webgpu dawn
    cargo check -p wasmer-cli --features webgpu-window
    ```
 

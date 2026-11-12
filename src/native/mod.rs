@@ -2,9 +2,7 @@
 //! them: running an import ([`enter`]), the registry of guest processes, the
 //! queue of completed events, and the handle table.
 //!
-//! A build has one native host, `crate::host`: the wgpu one by default, the
-//! Dawn one with the `dawn` feature. Code here names it only through
-//! `crate::host::Host`.
+//! A build has one native host. Code here uses it through `crate::host::Host`.
 
 pub(crate) mod events;
 pub(crate) mod table;

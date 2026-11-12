@@ -4,7 +4,8 @@
 //! symbol of the standard header) and ends up importing raw functions from the
 //! [`WEBGPU_MODULE_NAME`] module. This crate provides those imports:
 //!
-//! - natively, on top of [`wgpu`], for the Wasmer CLI and the Rust-based SDKs;
+//! - natively, on top of Dawn by default or wgpu with `default-features = false`
+//!   and the `wgpu` feature, for the Wasmer CLI and Rust-based SDKs;
 //! - in a browser (`js` feature on wasm32), by handing the guest JavaScript
 //!   functions that talk to `navigator.gpu` directly.
 //!
@@ -28,12 +29,13 @@ pub mod abi;
 pub mod cli;
 mod ctx;
 mod env;
-// The native host: wgpu by default, Dawn with the `dawn` feature. Both are
-// `crate::host` to the rest of the crate.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "dawn")))]
-mod host;
+// Both native backends are `crate::host` to the rest of the crate.
+// Dawn takes precedence when both features are enabled.
 #[cfg(all(not(target_arch = "wasm32"), feature = "dawn"))]
 #[path = "dawn/mod.rs"]
+mod host;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wgpu", not(feature = "dawn")))]
+#[path = "wgpu/mod.rs"]
 mod host;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;

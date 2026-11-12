@@ -1,4 +1,4 @@
-//! Links Dawn for the `dawn` feature; nothing to do otherwise.
+//! Selects the native backend and links Dawn when enabled.
 //!
 //! Dawn is found through `WASMER_WEBGPU_DAWN_DIR`, a Dawn install (`include/`
 //! and `lib/` with the monolithic `webgpu_dawn` library), or else in
@@ -9,6 +9,11 @@
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=WASMER_WEBGPU_DAWN_DIR");
+    #[cfg(not(any(feature = "dawn", feature = "wgpu")))]
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32") {
+        panic!("native builds require the `dawn` or `wgpu` Cargo feature");
+    }
+
     #[cfg(feature = "dawn")]
     dawn::link();
 }
@@ -19,11 +24,11 @@ mod dawn {
     use std::path::PathBuf;
 
     pub fn link() {
-        let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
-            // The browser host is JavaScript; Dawn is only for native hosts.
+            // The browser host uses JavaScript.
             return;
         }
+        let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("set by cargo"));
         let dir = env::var_os("WASMER_WEBGPU_DAWN_DIR")
             .map(PathBuf::from)

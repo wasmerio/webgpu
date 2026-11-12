@@ -127,7 +127,7 @@ fn a_surface_moved_to_another_device_presents_what_that_device_drew() {
 
 /// Whether the native host's backend writes a timestamp from an encoder.
 /// wgpu does wherever the adapter can.
-#[cfg(not(feature = "dawn"))]
+#[cfg(all(feature = "wgpu", not(feature = "dawn")))]
 fn encoder_timestamps_written() -> bool {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
