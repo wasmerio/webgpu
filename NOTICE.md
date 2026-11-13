@@ -19,6 +19,8 @@ The files generated from them by `codegen/` (`*.gen.*`, and
 
 `spec/webidl_enums.json` is derived from `src/dawn/dawn.json` of
 <https://dawn.googlesource.com/dawn> by `codegen/derive_webidl_enums.py`.
+The limit tiers of `src/native/limit_tiers.rs`, and the way they are applied,
+are those of `src/dawn/native/Limits.cpp` of the same repository.
 
 Copyright 2017 The Dawn & Tint Authors. BSD-3-Clause.
 

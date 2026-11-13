@@ -1,10 +1,12 @@
 //! What the native hosts share, whichever GPU library implements WebGPU for
 //! them: running an import ([`enter`]), the registry of guest processes, the
-//! queue of completed events, and the handle table.
+//! queue of completed events, the handle table, and the tiers an adapter's
+//! limits are rounded to.
 //!
 //! A build has one native host. Code here uses it through `crate::host::Host`.
 
 pub(crate) mod events;
+pub(crate) mod limit_tiers;
 pub(crate) mod table;
 
 use std::any::Any;

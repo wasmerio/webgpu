@@ -13,7 +13,7 @@ use wasmer_webgpu::cli::{RunOutput, run_wasix_main_capture};
 use wasmer_webgpu::surface::{
     CaptureFrames, FrameColorSpace, FrameFormat, FrameToneMapping, SingleSurface, SurfaceTarget,
 };
-use wasmer_webgpu::{WebGpuCtx, WebGpuCtxBuilder};
+use wasmer_webgpu::{WebGpuCtx, WebGpuCtxBuilder, WebGpuMemoryHint};
 
 fn program(name: &str) -> PathBuf {
     static BUILD: Once = Once::new();
@@ -306,5 +306,25 @@ fn terminate_all_gets_a_guest_out_of_a_wait_and_stays_in_effect() {
         later.stdout.contains("request adapter failed"),
         "{}",
         later.stdout
+    );
+}
+
+#[test]
+fn an_ordinary_program_runs_where_limits_are_tiered_and_memory_is_spared() {
+    // That the limits are tiers, and that more is refused, the hosts' own
+    // tests show. This shows that neither switch gets in a program's way:
+    // this one checks that its adapter's limits are at least the
+    // specification's defaults, and makes a device that requires one of them
+    // at the value it read.
+    let ctx = builder()
+        .tiered_limits(true)
+        .memory_hint(WebGpuMemoryHint::MemoryUsage)
+        .build();
+    let output = run(&ctx, "instance_info");
+    assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert!(
+        output.stdout.contains("required limits and features: ok"),
+        "{}",
+        output.stdout
     );
 }

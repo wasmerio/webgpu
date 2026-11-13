@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use super::adapter::{AdapterState, standard_features, write_limits};
+use super::adapter::{AdapterState, read_limits, standard_features, write_limits};
 use super::callbacks::InFlight;
 use super::dawn_ext::{
     FEATURE_BUFFER_MAP_EXTENDED_USAGES, FEATURE_IMPLICIT_DEVICE_SYNCHRONIZATION,
@@ -19,6 +19,7 @@ use super::{
 use crate::abi::enums::{CallbackMode, DeviceLostReason, ErrorType, FeatureName, Status};
 use crate::abi::structs::{DeviceDescriptor, Limits};
 use crate::abi::{AbiEnum, Cx, EVENT_DEVICE_LOST, EVENT_UNCAPTURED_ERROR, Handle, OutPtr};
+use crate::native::limit_tiers;
 
 /// A process's grant of mappable draw buffers, given back on drop unless the
 /// device that took it was made.
@@ -254,6 +255,20 @@ impl Host {
             return Err(early(&format!(
                 "This guest may have at most {max} devices."
             )));
+        }
+        // Dawn holds a request to the adapter's real limits. Where the guest
+        // was shown tiers of them, it is held to those.
+        if self.ctx.tiered_limits
+            && let Some(required) = descriptor.and_then(|d| d.required_limits.as_deref())
+        {
+            let (allowed, allowed_compat) = read_limits(true, true, |native| {
+                // SAFETY: a live adapter and a struct for Dawn to fill.
+                unsafe { ffi::wgpuAdapterGetLimits(adapter_state.raw, native) }
+            })
+            .ok_or_else(|| early("The adapter's limits are not available."))?;
+            if let Some(refusal) = limit_tiers::exceeded(required, &allowed, &allowed_compat) {
+                return Err(early(&refusal));
+            }
         }
 
         // Mappable draw buffers come with Dawn's unsafe APIs: only where the
@@ -501,7 +516,8 @@ impl Host {
         let Some(state) = self.device(device) else {
             return Status::Error;
         };
-        write_limits(&cx.mem, limits, |native| {
+        // A device's limits are the ones it was asked for: nothing to tier.
+        write_limits(&cx.mem, limits, false, |native| {
             // SAFETY: a live device and a struct for Dawn to fill.
             unsafe { ffi::wgpuDeviceGetLimits(state.raw, native) }
         })

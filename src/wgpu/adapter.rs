@@ -5,6 +5,7 @@ use crate::abi::api::AdapterApi;
 use crate::abi::enums::{FeatureName, Status};
 use crate::abi::structs::{CompatibilityModeLimits, Limits};
 use crate::abi::{AbiEnum, Cx, GuestMemory, GuestWrite, Handle, OutPtr};
+use crate::native::limit_tiers;
 
 pub(crate) struct AdapterState {
     pub(crate) adapter: wgpu::Adapter,
@@ -18,11 +19,30 @@ impl AdapterState {
     }
 }
 
+/// wgpu's limits as `webgpu.h`'s: the core ones and the compatibility-mode
+/// ones. `tiered` rounds them down to their tiers
+/// ([`crate::WebGpuCtxBuilder::tiered_limits`]), which is for an adapter's.
+pub(crate) fn abi_limits(limits: &wgpu::Limits, tiered: bool) -> (Limits, CompatibilityModeLimits) {
+    let mut core = convert::limits_to_abi(limits);
+    // Compatibility mode is not something this backend offers, so its extra
+    // limits take the values of the core limits they refine.
+    let mut compat = CompatibilityModeLimits {
+        max_storage_buffers_in_vertex_stage: limits.max_storage_buffers_per_shader_stage,
+        max_storage_textures_in_vertex_stage: limits.max_storage_textures_per_shader_stage,
+        max_storage_buffers_in_fragment_stage: limits.max_storage_buffers_per_shader_stage,
+        max_storage_textures_in_fragment_stage: limits.max_storage_textures_per_shader_stage,
+    };
+    if tiered {
+        limit_tiers::apply(&mut core, &mut compat);
+    }
+    (core, compat)
+}
+
 /// Fills a guest `WGPULimits` and the limit structs chained to it.
 pub(crate) fn write_limits(
     mem: &GuestMemory<'_>,
     out: OutPtr<Limits>,
-    limits: &wgpu::Limits,
+    (limits, compat): &(Limits, CompatibilityModeLimits),
 ) -> Status {
     if out.is_null() {
         return Status::Error;
@@ -31,21 +51,13 @@ pub(crate) fn write_limits(
     let Ok(guest) = out.read(mem) else {
         return Status::Error;
     };
-    if out.write(mem, &convert::limits_to_abi(limits)).is_err() {
+    if out.write(mem, limits).is_err() {
         return Status::Error;
     }
-    if let Some(ptr) = guest.chain.link(CompatibilityModeLimits::S_TYPE) {
-        // Compatibility mode is not something this backend offers, so its
-        // extra limits take the values of the core limits they refine.
-        let compat = CompatibilityModeLimits {
-            max_storage_buffers_in_vertex_stage: limits.max_storage_buffers_per_shader_stage,
-            max_storage_textures_in_vertex_stage: limits.max_storage_textures_per_shader_stage,
-            max_storage_buffers_in_fragment_stage: limits.max_storage_buffers_per_shader_stage,
-            max_storage_textures_in_fragment_stage: limits.max_storage_textures_per_shader_stage,
-        };
-        if compat.write(mem, ptr).is_err() {
-            return Status::Error;
-        }
+    if let Some(ptr) = guest.chain.link(CompatibilityModeLimits::S_TYPE)
+        && compat.write(mem, ptr).is_err()
+    {
+        return Status::Error;
     }
     Status::Success
 }
@@ -102,7 +114,11 @@ impl AdapterApi for Host {
         limits: OutPtr<Limits>,
     ) -> Status {
         match self.adapter(adapter) {
-            Some(adapter) => write_limits(&cx.mem, limits, &adapter.adapter.limits()),
+            Some(adapter) => write_limits(
+                &cx.mem,
+                limits,
+                &abi_limits(&adapter.adapter.limits(), self.ctx.tiered_limits),
+            ),
             None => Status::Error,
         }
     }

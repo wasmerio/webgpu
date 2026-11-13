@@ -6,6 +6,7 @@ use super::{Extra, Host, Native, text};
 use crate::abi::enums::{FeatureName, Status};
 use crate::abi::structs::{CompatibilityModeLimits, Limits};
 use crate::abi::{AbiEnum, Cx, GuestMemory, GuestWrite, Handle, OutPtr};
+use crate::native::limit_tiers;
 
 pub(crate) struct AdapterState {
     /// Dawn's adapter, borrowed from the owning [`Native`].
@@ -99,11 +100,39 @@ pub(crate) fn standard_features(
     out
 }
 
+/// The limits `get` writes into native structs, as `webgpu.h`'s: the core
+/// ones, and the compatibility-mode ones when `with_compat` has them asked
+/// for. `tiered` rounds them down to their tiers, which takes both.
+pub(crate) fn read_limits(
+    with_compat: bool,
+    tiered: bool,
+    get: impl FnOnce(*mut ffi::WGPULimits) -> u32,
+) -> Option<(Limits, CompatibilityModeLimits)> {
+    let mut compat = ffi::WGPUCompatibilityModeLimits::default();
+    compat.chain.sType = CompatibilityModeLimits::S_TYPE;
+    let mut native = ffi::WGPULimits::default();
+    if with_compat || tiered {
+        native.nextInChain = (&mut compat as *mut ffi::WGPUCompatibilityModeLimits).cast();
+    }
+    if get(&mut native) != Status::Success.as_u32() {
+        return None;
+    }
+    let mut limits = raise_limits(&native);
+    let mut compat = raise_compatibility_mode_limits(&compat);
+    if tiered {
+        limit_tiers::apply(&mut limits, &mut compat);
+    }
+    Some((limits, compat))
+}
+
 /// Fills a guest `WGPULimits`, and a `WGPUCompatibilityModeLimits` chained to
-/// it, from what `get` writes into native ones.
+/// it, from what `get` writes into native ones. `tiered` is for an adapter's
+/// limits where the embedder has them tiered
+/// ([`crate::WebGpuCtxBuilder::tiered_limits`]).
 pub(crate) fn write_limits(
     mem: &GuestMemory<'_>,
     out: OutPtr<Limits>,
+    tiered: bool,
     get: impl FnOnce(*mut ffi::WGPULimits) -> u32,
 ) -> Status {
     if out.is_null() {
@@ -114,24 +143,15 @@ pub(crate) fn write_limits(
         return Status::Error;
     };
     let compat_ptr = guest.chain.link(CompatibilityModeLimits::S_TYPE);
-    let mut compat = ffi::WGPUCompatibilityModeLimits::default();
-    compat.chain.sType = CompatibilityModeLimits::S_TYPE;
-    let mut native = ffi::WGPULimits::default();
-    if compat_ptr.is_some() {
-        native.nextInChain = (&mut compat as *mut ffi::WGPUCompatibilityModeLimits).cast();
-    }
-    if get(&mut native) != Status::Success.as_u32() {
+    let Some((mut limits, compat)) = read_limits(compat_ptr.is_some(), tiered, get) else {
         return Status::Error;
-    }
-    let mut limits = raise_limits(&native);
+    };
     limits.chain = guest.chain.clone();
     if out.write(mem, &limits).is_err() {
         return Status::Error;
     }
     if let Some(ptr) = compat_ptr
-        && raise_compatibility_mode_limits(&compat)
-            .write(mem, ptr)
-            .is_err()
+        && compat.write(mem, ptr).is_err()
     {
         return Status::Error;
     }
@@ -148,7 +168,7 @@ impl Host {
         let Some(object) = self.object(adapter, Kind::Adapter) else {
             return Status::Error;
         };
-        write_limits(&cx.mem, limits, |native| {
+        write_limits(&cx.mem, limits, self.ctx.tiered_limits, |native| {
             // SAFETY: a live adapter and a struct for Dawn to fill.
             unsafe { ffi::wgpuAdapterGetLimits(object.raw.cast(), native) }
         })

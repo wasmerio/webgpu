@@ -21,6 +21,7 @@ use crate::abi::{
     EVENT_DEVICE_LOST, EVENT_POP_ERROR_SCOPE, EVENT_REQUEST_ADAPTER, EVENT_REQUEST_DEVICE,
     GuestMemory,
 };
+use crate::native::limit_tiers;
 
 /// Longest a waiting thread sleeps before it looks again for termination and
 /// for events completed by another thread.
@@ -187,7 +188,19 @@ impl Host {
         if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
             features |= available & wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         }
-        let required_limits = match descriptor.and_then(|d| d.required_limits.as_deref()) {
+        let required = descriptor.and_then(|d| d.required_limits.as_deref());
+        // wgpu holds a request to the adapter's real limits. Where the guest
+        // was shown tiers of them, it is held to those.
+        if self.ctx.tiered_limits
+            && let Some(required) = required
+        {
+            let (allowed, allowed_compat) =
+                super::adapter::abi_limits(&adapter.adapter.limits(), true);
+            if let Some(refusal) = limit_tiers::exceeded(required, &allowed, &allowed_compat) {
+                return Err(refusal);
+            }
+        }
+        let required_limits = match required {
             Some(limits) => convert::limits_from_abi(limits, wgpu::Limits::defaults()),
             None => wgpu::Limits::defaults(),
         };
@@ -197,7 +210,10 @@ impl Host {
                 required_features: features,
                 required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::Performance,
+                memory_hints: match self.ctx.memory_hint {
+                    crate::WebGpuMemoryHint::Performance => wgpu::MemoryHints::Performance,
+                    crate::WebGpuMemoryHint::MemoryUsage => wgpu::MemoryHints::MemoryUsage,
+                },
                 trace: wgpu::Trace::Off,
             }))
             .map_err(|error| error.to_string())?;
@@ -650,5 +666,105 @@ impl ShimApi for Host {
             Some(bytes) => write_blob(&cx.mem, buf, cap, &bytes),
             None => Ok(-1),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::api::{AdapterApi, GlobalApi};
+    use crate::abi::enums::Status;
+    use crate::abi::structs::Limits;
+    use crate::abi::{GuestMemory, OutPtr};
+
+    #[test]
+    fn a_tiered_adapter_shows_tiers_and_refuses_a_device_beyond_them() {
+        let ctx = crate::WebGpuCtx::builder()
+            .tiered_limits(true)
+            .force_fallback_adapter(super::super::test_fallback_adapter())
+            .build();
+        let host = Host::new(Arc::clone(&ctx.inner));
+        let mut store = wasmer::Store::default();
+        let memory = wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false))
+            .expect("a guest memory");
+        let stopped = || false;
+        let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
+        let instance = host.create_instance(&mut cx, None);
+        let Ok(state) = host.request_adapter(instance, None) else {
+            eprintln!("no adapter: skipped");
+            return;
+        };
+        let real = state.adapter.limits();
+        let adapter = host.insert(Object::Adapter(Arc::new(state)), instance);
+
+        // What the guest reads is the tiers: at most what the adapter has,
+        // and one of a few values.
+        let out = OutPtr::<Limits>::new(64);
+        assert_eq!(
+            host.adapter_get_limits(&mut cx, adapter, out),
+            Status::Success
+        );
+        let shown = out.read(&cx.mem).expect("the limits the guest was given");
+        assert!(shown.max_texture_dimension_2d <= real.max_texture_dimension_2d);
+        assert!(
+            [4096, 8192, 16384].contains(&shown.max_texture_dimension_2d),
+            "{}",
+            shown.max_texture_dimension_2d
+        );
+        assert!(shown.max_buffer_size <= real.max_buffer_size);
+        assert!(shown.min_uniform_buffer_offset_alignment >= 256);
+        let (tiered, _) = super::super::adapter::abi_limits(&real, true);
+        assert_eq!(
+            shown.max_texture_dimension_2d,
+            tiered.max_texture_dimension_2d
+        );
+        assert_eq!(shown.max_buffer_size, tiered.max_buffer_size);
+        assert_eq!(
+            shown.max_storage_buffers_per_shader_stage,
+            tiered.max_storage_buffers_per_shader_stage
+        );
+        // Limits between two tiers, whatever this machine's adapter has.
+        let between = wgpu::Limits {
+            max_texture_dimension_1d: 10000,
+            max_texture_dimension_2d: 10000,
+            max_storage_buffers_per_shader_stage: 12,
+            min_uniform_buffer_offset_alignment: 16,
+            ..wgpu::Limits::defaults()
+        };
+        let (exact, _) = super::super::adapter::abi_limits(&between, false);
+        assert_eq!(exact.max_texture_dimension_2d, 10000);
+        assert_eq!(exact.min_uniform_buffer_offset_alignment, 16);
+        let (tiered, compat) = super::super::adapter::abi_limits(&between, true);
+        assert_eq!(tiered.max_texture_dimension_2d, 8192);
+        assert_eq!(tiered.max_storage_buffers_per_shader_stage, 10);
+        assert_eq!(compat.max_storage_buffers_in_fragment_stage, 10);
+        assert_eq!(tiered.min_uniform_buffer_offset_alignment, 256);
+
+        // A device may have what the guest was shown, and no more, whatever
+        // the adapter could give.
+        let mut required = limit_tiers::undefined();
+        required.max_texture_dimension_2d = shown.max_texture_dimension_2d;
+        let descriptor = DeviceDescriptor {
+            required_limits: Some(Box::new(required.clone())),
+            ..DeviceDescriptor::default()
+        };
+        let device = host
+            .request_device(adapter, Some(&descriptor), 1)
+            .expect("a device at the tier");
+        device.destroy();
+
+        required.max_texture_dimension_2d = shown.max_texture_dimension_2d + 1;
+        let descriptor = DeviceDescriptor {
+            required_limits: Some(Box::new(required)),
+            ..DeviceDescriptor::default()
+        };
+        let refusal = host
+            .request_device(adapter, Some(&descriptor), 2)
+            .err()
+            .expect("no device beyond the tier");
+        assert!(
+            refusal.contains("maxTextureDimension2D") && refusal.contains("this adapter supports"),
+            "{refusal}"
+        );
     }
 }

@@ -49,8 +49,8 @@ mod web;
 pub mod window;
 
 pub use ctx::{
-    WebGpuCtx, WebGpuCtxBuilder, WebGpuInstantiationState, WebGpuLimits, WebGpuRuntimeControl,
-    WebGpuRuntimeHooks, WebGpuUsage,
+    WebGpuCtx, WebGpuCtxBuilder, WebGpuInstantiationState, WebGpuLimits, WebGpuMemoryHint,
+    WebGpuRuntimeControl, WebGpuRuntimeHooks, WebGpuUsage,
 };
 
 /// Name of the import module every WebGPU import lives in.
