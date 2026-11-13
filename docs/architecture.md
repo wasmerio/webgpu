@@ -294,6 +294,45 @@ next guest on its worker. The host therefore keeps every queue reachable
 until the browser reports its submitted work done
 (`tests/browser`: `embedder_thread_reuse`).
 
+## What an embedder decides about the GPU
+
+Most of a `WebGpuCtx` is about how much a guest may hold. Two of its switches
+are about the GPU itself, and both are off unless the embedder turns them on.
+
+**Tiered limits** (`WebGpuCtxBuilder::tiered_limits`). An adapter's exact
+limits say a good deal about the GPU and its driver, which is of no use to a
+program and of some use to one that wants to tell machines apart. With the
+switch on, a guest is shown each limit rounded down to one of a few steps, as
+a browser shows them to a page. Limits that belong together (the sizes of a
+compute workgroup, the dimensions of a texture) form a group and take the
+highest tier all of them reach.
+
+The native hosts do this themselves, in `src/native/limit_tiers.rs`, on the
+structs of `webgpu.h`, so the steps are the same whichever GPU library is
+underneath. The tiers are Dawn's. Dawn can tier an adapter's limits too, but
+only through its C++ API, and wgpu 29 cannot at all.
+
+Only an adapter's limits are tiered: a device's limits are the ones it was
+asked for. A request for a limit beyond its adapter's tier fails, as one
+beyond the adapter's real limit does, since granting it would tell the guest
+what the tier hides. Features and the adapter's info are not touched. In a
+browser the limits are whatever the browser gives, and the switch does
+nothing.
+
+**Memory hint** (`WebGpuCtxBuilder::memory_hint`). Whether a device should
+allocate GPU memory in large blocks, which is faster, or in small ones, which
+leaves a device that uses little holding little. It is a hint because only
+some backends allocate in blocks themselves:
+
+| Host | Vulkan | Direct3D 12 | Metal |
+| --- | --- | --- | --- |
+| wgpu | followed | followed | nothing to follow: Metal allocates |
+| Dawn | not followed | not followed | nothing to follow: Metal allocates |
+
+Dawn has a block size for its Vulkan allocator, as an experimental feature
+that needs its `allow_unsafe_apis` toggle on the device. That toggle opens
+more than the allocator to a guest, so the host does not set it for this.
+
 ## Versioning
 
 - The import module name (`wasmer_webgpu_v0`) changes when the ABI breaks. A

@@ -41,11 +41,26 @@ pub struct WebGpuUsage {
     pub gpu_memory_bytes: u64,
 }
 
+/// How the devices of a context's guests should trade memory for speed
+/// ([`WebGpuCtxBuilder::memory_hint`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WebGpuMemoryHint {
+    /// Allocate GPU memory in large blocks: fewer allocations, more memory
+    /// held per device. The default.
+    #[default]
+    Performance,
+    /// Allocate in small blocks: a device that uses little holds little. For
+    /// an embedder with many guests, each with a device of its own.
+    MemoryUsage,
+}
+
 /// Builds a [`WebGpuCtx`].
 #[derive(Default)]
 pub struct WebGpuCtxBuilder {
     limits: WebGpuLimits,
     force_fallback_adapter: bool,
+    tiered_limits: bool,
+    memory_hint: WebGpuMemoryHint,
     #[cfg(not(target_arch = "wasm32"))]
     surfaces: Option<Arc<dyn crate::surface::SurfaceProvider>>,
     event_waker: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -89,6 +104,33 @@ impl WebGpuCtxBuilder {
     /// Only ever hand guests a software adapter, whatever they ask for.
     pub fn force_fallback_adapter(mut self, force: bool) -> Self {
         self.force_fallback_adapter = force;
+        self
+    }
+
+    /// Shows guests an adapter's limits rounded down to a few tiers, and
+    /// refuses a device that asks for more than its adapter's tier. For an
+    /// embedder whose guests are not trusted to know which GPU they run on (a
+    /// browser engine running a page's scripts): exact limits help tell one
+    /// machine from another. The tiers are Dawn's, and both native hosts apply
+    /// the same ones. Off by default.
+    ///
+    /// Only limits are tiered. An adapter's info and features are reported as
+    /// they are.
+    ///
+    /// In a browser the limits are the browser's own, tiered or not as it sees
+    /// fit, and this does nothing.
+    pub fn tiered_limits(mut self, tiered: bool) -> Self {
+        self.tiered_limits = tiered;
+        self
+    }
+
+    /// How the devices of this context's guests allocate GPU memory. A hint:
+    /// the wgpu host follows it on Vulkan and Direct3D 12, where it allocates
+    /// memory in blocks itself. Metal allocates for either host, and the
+    /// Dawn host has nothing to pass it to (see docs/dawn.md), so there it
+    /// changes nothing.
+    pub fn memory_hint(mut self, hint: WebGpuMemoryHint) -> Self {
+        self.memory_hint = hint;
         self
     }
 
@@ -141,6 +183,8 @@ impl WebGpuCtxBuilder {
             inner: Arc::new(CtxInner {
                 limits: self.limits,
                 force_fallback_adapter: self.force_fallback_adapter,
+                tiered_limits: self.tiered_limits,
+                memory_hint: self.memory_hint,
                 #[cfg(not(target_arch = "wasm32"))]
                 surfaces: self
                     .surfaces
@@ -166,6 +210,15 @@ pub(crate) struct CtxInner {
     )]
     pub(crate) renderer_mapped_draw_buffers: bool,
     pub(crate) force_fallback_adapter: bool,
+    /// WebGpuCtxBuilder::tiered_limits.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) tiered_limits: bool,
+    /// WebGpuCtxBuilder::memory_hint.
+    #[cfg_attr(
+        not(all(not(target_arch = "wasm32"), feature = "wgpu", not(feature = "dawn"))),
+        allow(dead_code)
+    )]
+    pub(crate) memory_hint: WebGpuMemoryHint,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) surfaces: Arc<dyn crate::surface::SurfaceProvider>,
     /// Host state of every live guest process started through this context.
@@ -184,6 +237,8 @@ impl std::fmt::Debug for CtxInner {
         f.debug_struct("WebGpuCtx")
             .field("limits", &self.limits)
             .field("force_fallback_adapter", &self.force_fallback_adapter)
+            .field("tiered_limits", &self.tiered_limits)
+            .field("memory_hint", &self.memory_hint)
             .finish_non_exhaustive()
     }
 }
@@ -458,6 +513,19 @@ mod tests {
             .renderer_mapped_draw_buffers(true)
             .build();
         assert!(ctx.inner.renderer_mapped_draw_buffers);
+    }
+
+    #[test]
+    fn guests_see_exact_limits_and_fast_allocation_unless_the_embedder_says_otherwise() {
+        let ctx = WebGpuCtx::default();
+        assert!(!ctx.inner.tiered_limits);
+        assert_eq!(ctx.inner.memory_hint, WebGpuMemoryHint::Performance);
+        let ctx = WebGpuCtx::builder()
+            .tiered_limits(true)
+            .memory_hint(WebGpuMemoryHint::MemoryUsage)
+            .build();
+        assert!(ctx.inner.tiered_limits);
+        assert_eq!(ctx.inner.memory_hint, WebGpuMemoryHint::MemoryUsage);
     }
 
     #[test]

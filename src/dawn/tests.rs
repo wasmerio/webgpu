@@ -673,3 +673,82 @@ fn only_a_device_granted_mapped_draw_buffers_enumerates_them() {
         plain_state.destroy(std::time::Duration::ZERO);
     }
 }
+
+#[test]
+fn a_tiered_adapter_shows_tiers_and_refuses_a_device_beyond_them() {
+    use crate::abi::api::GlobalApi;
+    use crate::abi::{Cx, GuestMemory, OutPtr};
+    use crate::native::limit_tiers;
+
+    let ctx = crate::WebGpuCtx::builder().tiered_limits(true).build();
+    let host = Host::new(Arc::clone(&ctx.inner));
+    let mut store = wasmer::Store::default();
+    let memory = wasmer::Memory::new(&mut store, wasmer::MemoryType::new(1, None, false))
+        .expect("a guest memory");
+    let stopped = || false;
+    let mut cx = Cx::new(GuestMemory::new(memory.view(&store)), &stopped);
+    let instance = host.create_instance(&mut cx, None);
+    let Ok(state) = host.request_adapter(instance, None) else {
+        eprintln!("no adapter: skipped");
+        return;
+    };
+    let raw = state.raw;
+    let adapter = host.insert_adapter(state, instance);
+    // SAFETY: a live adapter and a struct for Dawn to fill.
+    let get = move |native| unsafe { ffi::wgpuAdapterGetLimits(raw, native) };
+    let (real, _) = adapter::read_limits(true, false, get).expect("Dawn's limits");
+    let (tiered, _) = adapter::read_limits(true, true, get).expect("their tiers");
+
+    // What the guest reads is the tiers: at most what the adapter has, and
+    // one of a few values.
+    let out = OutPtr::<g::Limits>::new(64);
+    assert_eq!(
+        host.manual_adapter_get_limits(&mut cx, adapter, out),
+        crate::abi::enums::Status::Success
+    );
+    let shown = out.read(&cx.mem).expect("the limits the guest was given");
+    assert_eq!(
+        shown.max_texture_dimension_2d,
+        tiered.max_texture_dimension_2d
+    );
+    assert_eq!(shown.max_buffer_size, tiered.max_buffer_size);
+    assert!(shown.max_texture_dimension_2d <= real.max_texture_dimension_2d);
+    assert!(
+        [4096, 8192, 16384].contains(&shown.max_texture_dimension_2d),
+        "{}",
+        shown.max_texture_dimension_2d
+    );
+    assert!(shown.max_buffer_size <= real.max_buffer_size);
+    assert_eq!(shown.min_uniform_buffer_offset_alignment, 256);
+
+    // A device may have what the guest was shown, and no more, whatever the
+    // adapter could give.
+    let mut required = limit_tiers::undefined();
+    required.max_texture_dimension_2d = shown.max_texture_dimension_2d;
+    let descriptor = g::DeviceDescriptor {
+        required_limits: Some(Box::new(required.clone())),
+        ..g::DeviceDescriptor::default()
+    };
+    let device = host
+        .request_device(adapter, Some(&descriptor), 1)
+        .ok()
+        .expect("a device at the tier");
+    device.destroy(std::time::Duration::ZERO);
+
+    required.max_texture_dimension_2d = shown.max_texture_dimension_2d + 1;
+    let descriptor = g::DeviceDescriptor {
+        required_limits: Some(Box::new(required)),
+        ..g::DeviceDescriptor::default()
+    };
+    let refusal = host
+        .request_device(adapter, Some(&descriptor), 2)
+        .err()
+        .expect("no device beyond the tier");
+    assert!(
+        refusal.message.contains("maxTextureDimension2D")
+            && refusal.message.contains("this adapter supports"),
+        "{}",
+        refusal.message
+    );
+    assert!(!refusal.lost_reported);
+}

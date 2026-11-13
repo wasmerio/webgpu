@@ -71,7 +71,14 @@ let runtime = OverriddenRuntime::new(runtime).with_instantiation_hook(ctx.runtim
 
 A `WebGpuCtx` is what an embedder grants its guests: limits on devices,
 objects and GPU memory, a software-adapter-only switch, and a
-`SurfaceProvider` that decides what a guest's surface presents to. The hooks
+`SurfaceProvider` that decides what a guest's surface presents to. Two more
+switches are about what the GPU itself gives away and takes:
+`tiered_limits(true)` shows guests an adapter's limits rounded down to a few
+tiers, for guests that should not learn which GPU they run on, and
+`memory_hint(WebGpuMemoryHint::MemoryUsage)` asks for devices that hold
+little memory when they use little
+([docs/architecture.md](docs/architecture.md#what-an-embedder-decides-about-the-gpu)).
+The hooks
 add imports only to modules that ask for WebGPU and are inert for everything
 else. `ctx.runtime_control().terminate_all()` stops the GPU work of every
 guest of the context.

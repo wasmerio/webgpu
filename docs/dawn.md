@@ -118,6 +118,15 @@ ABI:
   the process gets the toggle. A guest that asks for the feature without it
   is refused, as it is for any other feature outside `webgpu.h`. The wgpu
   host has nothing like it.
+- `WebGpuCtxBuilder::memory_hint` changes nothing here. Dawn sizes the blocks
+  of its Vulkan allocator through `DawnDeviceAllocatorControl`, an
+  experimental feature granted only with `allow_unsafe_apis`, which the host
+  keeps for the one device described above; its other backends have no such
+  setting. (wgpu follows the hint on Vulkan and Direct3D 12.)
+- `WebGpuCtxBuilder::tiered_limits` works as on the wgpu host, with the same
+  tiers: the host rounds the limits Dawn reports and holds device requests
+  to them itself. Dawn's own `SetUseTieredLimits` is not used, as it is part
+  of Dawn's C++ API and not of `webgpu.h`.
 - `WebGpuCtxBuilder::force_fallback_adapter` (`WEBGPU_TEST_FALLBACK_ADAPTER`
   for the tests) asks Dawn for its fallback adapter, and Dawn has one only
   with SwiftShader, which this build leaves out: Mesa's lavapipe or WARP are

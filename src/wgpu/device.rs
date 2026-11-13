@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::adapter::{has_feature, write_limits};
+use super::adapter::{abi_limits, has_feature, write_limits};
 use super::{Events, Host, Object, ObjectKind, Record, lock, scopes};
 use crate::abi::api::DeviceApi;
 use crate::abi::enums::{DeviceLostReason, ErrorFilter, ErrorType, Status};
@@ -297,7 +297,10 @@ impl DeviceApi for Host {
 
     fn device_get_limits(&self, cx: &mut Cx<'_>, device: Handle, limits: OutPtr<Limits>) -> Status {
         match self.device(device) {
-            Some(device) => write_limits(&cx.mem, limits, &device.device.limits()),
+            // A device's limits are the ones it was asked for: nothing to tier.
+            Some(device) => {
+                write_limits(&cx.mem, limits, &abi_limits(&device.device.limits(), false))
+            }
             None => Status::Error,
         }
     }
